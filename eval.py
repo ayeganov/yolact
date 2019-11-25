@@ -259,6 +259,36 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
     
     return img_numpy
 
+def display_preds(preds, frames, alpha=0.2):
+    """
+    Display the predictions
+    """
+    N, H, W, D = frames.shape
+    label_map = get_label_map()
+    class_names = cfg.dataset.class_names
+    for ind in range(N):
+        frame = frames[ind].cpu().numpy().astype(np.uint8)
+
+        classes, scores, boxes, masks = preds[ind]
+        L = len(classes)
+        for k in range(L):
+            pts = masks[k]
+
+            if len(pts) == 0:
+                continue
+            cv2.drawContours(frame, [pts], -1, (0,0,255), 1)
+
+            x1, y1, x2, y2 = boxes[k].tolist()
+            _class = cfg.dataset.class_names[classes[k]]
+            text_str = '%s: %.2f' % (_class, scores[k]) if args.display_scores else _class
+            cv2.putText(frame, text_str, (x1, y1),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 1)
+
+        cv2.imshow('frame', frame)
+        k = cv2.waitKey(0)
+        if k == ord('q'):
+            break
+
 def prep_benchmark(dets_out, h, w):
     with timer.env('Postprocess'):
         t = postprocess(dets_out, w, h, crop_masks=args.crop, score_threshold=args.score_threshold)
@@ -586,24 +616,49 @@ def evalimage(net:Yolact, path:str, save_path:str=None):
     else:
         cv2.imwrite(save_path, img_numpy)
 
-def eval_torch(net:Yolact, images, N):
+def eval_torch(net:Yolact, images):
     """
-    Accepts a batched set of images and returns their segmentation map.
+    Accepts a batched set of images and returns their segmentation maps.
+    Args:
+        - net: the YOLACT network
+        - images: A torch tensor of size [N, H, W, 3], where:
+                            N is the number of batched images,
+                            H is the height of the images, and
+                            W is the width of the images.
+
+    Returns 4 torch Tensors (in the following order):
+        - classes [num_det]: The class idx for each detection.
+        - scores  [num_det]: The confidence score for each detection.
+        - boxes   [num_det, 4]: The bounding box for each detection in absolute point form.
+        - seg     [num_det]: Segmentation region in pixel coordinates
     """
-    start = time.time()
     N, H, W, D = images.shape
     batch = FastBaseTransform()(images)
     preds = net(batch)
+    # TODO(jafek.ben) this takes just as long to extract as to run...
     output = []
     for i in range(N):
         results = postprocess(preds, W, H, i)
-        classes, scores, boxes = [x[:args.top_k].cpu().numpy() for x in results[:3]]
-        num_dets_to_consider = min(args.top_k, classes.shape[0])
-        for j in range(num_dets_to_consider):
+        classes, scores, boxes, masks = results
+        num_dets = classes.shape[0]
+        segs = []
+        for j in range(num_dets):
+            curmask = masks[j].cpu().numpy().astype(np.uint8)*255
+            _, pts, _ = cv2.findContours(curmask,
+                                         cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+            if not pts:
+                segs.append([])
+                continue
+
+            large = max(pts, key=cv2.contourArea)
+            segs.append(large[::-1])  # We want the points to be clockwise
+
             if scores[j] < args.score_threshold:
-                num_dets_to_consider = j
+                output.append([classes[:j],
+                               scores[:j],
+                               boxes[:j],
+                               segs])
                 break
-        output.append(results[:num_dets_to_consider])
     return output
 
 def evalimages(net:Yolact, input_folder:str, output_folder:str):
@@ -617,14 +672,17 @@ def evalimages(net:Yolact, input_folder:str, output_folder:str):
             break
         path = str(p)
         fnames.append(path)
+        continue
+
         name = os.path.basename(path)
         name = '.'.join(name.split('.')[:-1]) + '.png'
         out_path = os.path.join(output_folder, name)
 
         evalimage(net, path, out_path)
-        print(path + ' -> ' + out_path)
     frames = torch.from_numpy(np.array([cv2.imread(fname) for fname in fnames])).cuda().float()
-    preds = eval_torch(net, frames, 6)
+    preds = eval_torch(net, frames)
+    display_preds(preds, frames)
+
     print('Done.')
 
 from multiprocessing.pool import ThreadPool
@@ -1105,5 +1163,4 @@ if __name__ == '__main__':
             net = net.cuda()
 
         evaluate(net, dataset)
-
 
