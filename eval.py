@@ -276,7 +276,7 @@ def display_preds(preds, frames, alpha=0.2):
 
             if len(pts) == 0:
                 continue
-            cv2.drawContours(frame, [pts], -1, (0,0,255), 1)
+            cv2.drawContours(frame, [np.array(pts).reshape(-1, 1, 2)], -1, (0,0,255), 1)
 
             x1, y1, x2, y2 = boxes[k].tolist()
             _class = cfg.dataset.class_names[classes[k]]
@@ -616,6 +616,13 @@ def evalimage(net:Yolact, path:str, save_path:str=None):
     else:
         cv2.imwrite(save_path, img_numpy)
 
+def mask2pts(mask):
+    cur_mask = mask.cpu().numpy().astype(np.uint8)*255
+    _, pts, _ = cv2.findContours(cur_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    large = max(pts, key=cv2.contourArea, default=[])
+    large = np.array(large).reshape(-1, 2).tolist()
+    return large[::-1]
+
 def eval_torch(net:Yolact, images):
     """
     Accepts a batched set of images and returns their segmentation maps.
@@ -623,8 +630,9 @@ def eval_torch(net:Yolact, images):
         - net: the YOLACT network
         - images: A torch tensor of size [N, H, W, 3], where:
                             N is the number of batched images,
-                            H is the height of the images, and
-                            W is the width of the images.
+                            H is the height of the images,
+                            W is the width of the images, and
+                            the image has 3 color channels: BGR.
 
     Returns 4 torch Tensors (in the following order):
         - classes [num_det]: The class idx for each detection.
@@ -632,33 +640,23 @@ def eval_torch(net:Yolact, images):
         - boxes   [num_det, 4]: The bounding box for each detection in absolute point form.
         - seg     [num_det]: Segmentation region in pixel coordinates
     """
+    start = time.time()
+    print (time.time() - start)
     N, H, W, D = images.shape
     batch = FastBaseTransform()(images)
+    print (time.time() - start)
     preds = net(batch)
-    # TODO(jafek.ben) this takes just as long to extract as to run...
+    print (time.time() - start)
     output = []
     for i in range(N):
-        results = postprocess(preds, W, H, i)
-        classes, scores, boxes, masks = results
-        num_dets = classes.shape[0]
-        segs = []
-        for j in range(num_dets):
-            curmask = masks[j].cpu().numpy().astype(np.uint8)*255
-            _, pts, _ = cv2.findContours(curmask,
-                                         cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-            if not pts:
-                segs.append([])
-                continue
+        classes, scores, boxes, masks = postprocess(preds, W, H, i, score_threshold=args.score_threshold)
+        one_line = [classes, scores, boxes]
+        num_dets = masks.shape[0]
+        segs = [mask2pts(masks[j]) for j in range(num_dets)]
+        one_line.append(segs)
+        output.append(one_line)
 
-            large = max(pts, key=cv2.contourArea)
-            segs.append(large[::-1])  # We want the points to be clockwise
-
-            if scores[j] < args.score_threshold:
-                output.append([classes[:j],
-                               scores[:j],
-                               boxes[:j],
-                               segs])
-                break
+    print (time.time() - start)
     return output
 
 def evalimages(net:Yolact, input_folder:str, output_folder:str):
