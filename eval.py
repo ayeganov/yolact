@@ -30,6 +30,27 @@ import matplotlib.pyplot as plt
 import cv2
 
 import time
+import zmq
+import random
+
+port = "8000"
+context = zmq.Context()
+socket = context.socket(zmq.PUB)
+socket.bind("tcp://*:%s" % port)
+
+def publish_data(classes, scores, boxes, masks):
+    global socket
+    pts = [mask2pts(i) for i in masks]
+
+    outstr = ''
+    for cat, score, (x1, y1, x2, y2), pt in zip(classes, scores, boxes, pts):
+        outstr += '{},{},{},{},{},{},{}\n'.format(cat, score, x1,y1,x2,y2, pt)
+    topic = "10001"
+    if outstr:
+        final = "{}:\t{}".format(topic, outstr)
+    else:
+        final = "{}:\tnone".format(topic)
+    socket.send_string(final)
 
 def str2bool(v):
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
@@ -115,6 +136,10 @@ def parse_args(argv=None):
                         help='When displaying / saving video, draw the FPS on the frame')
     parser.add_argument('--emulate_playback', default=False, dest='emulate_playback', action='store_true',
                         help='When saving a video, emulate the framerate that you\'d get running in real-time mode.')
+    parser.add_argument('--to_write', default=False, type=str2bool,
+                        help='Whether or not to write the output data to a file')
+    parser.add_argument('--to_display', default=True, type=str2bool,
+                        help='Whether or not to display the video')
 
     parser.set_defaults(no_bar=False, display=False, resume=False, output_coco_json=False, output_web_json=False, shuffle=False,
                         benchmark=False, no_sort=False, no_hash=False, mask_proto_debug=False, crop=True, detect=False, display_fps=False,
@@ -134,7 +159,7 @@ coco_cats = {} # Call prep_coco_cats to fill this
 coco_cats_inv = {}
 color_cache = defaultdict(lambda: {})
 
-def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, mask_alpha=0.45, fps_str=''):
+def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, mask_alpha=0.45, fps_str='', to_write=False):
     """
     Note: If undo_transform=False then im_h and im_w are allowed to be None.
     """
@@ -156,6 +181,10 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
             # Masks are drawn on the GPU, so don't copy
             masks = t[3][:args.top_k]
         classes, scores, boxes = [x[:args.top_k].cpu().numpy() for x in t[:3]]
+
+    # jafek.ben TODO you can return here, no display
+    if to_write:
+        publish_data(classes, scores, boxes, masks)
 
     num_dets_to_consider = min(args.top_k, classes.shape[0])
     for j in range(num_dets_to_consider):
@@ -180,6 +209,7 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
                 color = torch.Tensor(color).to(on_gpu).float() / 255.
                 color_cache[on_gpu][color_idx] = color
             return color
+
 
     # First, draw the masks on the GPU where we can do it really fast
     # Beware: very fast but possibly unintelligible mask-drawing code ahead
@@ -711,10 +741,11 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
     target_fps   = round(vid.get(cv2.CAP_PROP_FPS))
     frame_width  = round(vid.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = round(vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    num_frames   = round(vid.get(cv2.CAP_PROP_FRAME_COUNT))
     
     if is_webcam:
         num_frames = float('inf')
+    else:
+        num_frames   = round(vid.get(cv2.CAP_PROP_FRAME_COUNT))
 
     net = CustomDataParallel(net).cuda()
     transform = torch.nn.DataParallel(FastBaseTransform()).cuda()
@@ -767,7 +798,7 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
     def prep_frame(inp, fps_str):
         with torch.no_grad():
             frame, preds = inp
-            return prep_display(preds, frame, None, None, undo_transform=False, class_color=True, fps_str=fps_str)
+            return prep_display(preds, frame, None, None, undo_transform=False, class_color=True, fps_str=fps_str, to_write=args.to_write)
 
     frame_buffer = Queue()
     video_fps = 0
@@ -792,7 +823,8 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
                         video_frame_times.add(next_time - last_time)
                         video_fps = 1 / video_frame_times.get_avg()
                     if out_path is None:
-                        cv2.imshow(path, frame_buffer.get())
+                        if args.to_display:
+                            cv2.imshow(path, frame_buffer.get())
                     else:
                         out.write(frame_buffer.get())
                     frames_displayed += 1
@@ -857,7 +889,8 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
     sequence = [prep_frame, eval_network, transform_frame]
     pool = ThreadPool(processes=len(sequence) + args.video_multiframe + 2)
     pool.apply_async(play_video)
-    active_frames = [{'value': extract_frame(first_batch, i), 'idx': 0} for i in range(len(first_batch[0]))]
+    # TODO(jafek.ben) must update if adding camera ID
+    active_frames = [{'value': extract_frame(first_batch, i), 'idx': 0, 'timestamp': 1e6*time.time()} for i in range(len(first_batch[0]))]
 
     print()
     if out_path is None: print('Press Escape to close.')
@@ -899,7 +932,8 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
 
                     if frame['idx'] == 0:
                         # Split this up into individual threads for prep_frame since it doesn't support batch size
-                        active_frames += [{'value': extract_frame(frame['value'], i), 'idx': 0} for i in range(1, len(frame['value'][0]))]
+                        # TODO(jafek.ben) must update if adding camera ID
+                        active_frames += [{'value': extract_frame(frame['value'], i), 'idx': 0, 'timestamp': 1e6*time.time()} for i in range(1, len(frame['value'][0]))]
                         frame['value'] = extract_frame(frame['value'], 0)
                 
                 # Finish loading in the next frames and add them to the processing queue
@@ -908,7 +942,8 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
                     if len(frames) == 0:
                         vid_done = True
                     else:
-                        active_frames.append({'value': frames, 'idx': len(sequence)-1})
+                        # TODO(jafek.ben) must update if adding camera ID
+                        active_frames.append({'value': frames, 'idx': len(sequence)-1, 'timestamp': 1e6*time.time()})
 
                 # Compute FPS
                 frame_times.add(time.time() - start_time)
