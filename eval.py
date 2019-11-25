@@ -29,6 +29,8 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import cv2
 
+import time
+
 def str2bool(v):
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
         return True
@@ -41,7 +43,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description='YOLACT COCO Evaluation')
     parser.add_argument('--trained_model',
-                        default='weights/ssd300_mAP_77.43_v2.pth', type=str,
+                        default='/home/ben/yolact/weights/yolact_im700_54_800000.pth', type=str,
                         help='Trained state_dict file path to open. If "interrupt", this will open the interrupt file.')
     parser.add_argument('--top_k', default=5, type=int,
                         help='Further restrict the number of predictions to parse')
@@ -584,19 +586,45 @@ def evalimage(net:Yolact, path:str, save_path:str=None):
     else:
         cv2.imwrite(save_path, img_numpy)
 
+def eval_torch(net:Yolact, images, N):
+    """
+    Accepts a batched set of images and returns their segmentation map.
+    """
+    start = time.time()
+    N, H, W, D = images.shape
+    batch = FastBaseTransform()(images)
+    preds = net(batch)
+    output = []
+    for i in range(N):
+        results = postprocess(preds, W, H, i)
+        classes, scores, boxes = [x[:args.top_k].cpu().numpy() for x in results[:3]]
+        num_dets_to_consider = min(args.top_k, classes.shape[0])
+        for j in range(num_dets_to_consider):
+            if scores[j] < args.score_threshold:
+                num_dets_to_consider = j
+                break
+        output.append(results[:num_dets_to_consider])
+    return output
+
 def evalimages(net:Yolact, input_folder:str, output_folder:str):
     if not os.path.exists(output_folder):
         os.mkdir(output_folder)
 
     print()
-    for p in Path(input_folder).glob('*'): 
+    fnames = []
+    for ind, p in enumerate(Path(input_folder).glob('*')):
+        if ind >= 6:
+            break
         path = str(p)
+        fnames.append(path)
         name = os.path.basename(path)
         name = '.'.join(name.split('.')[:-1]) + '.png'
         out_path = os.path.join(output_folder, name)
 
         evalimage(net, path, out_path)
         print(path + ' -> ' + out_path)
+    frames = torch.from_numpy(np.array([cv2.imread(fname) for fname in fnames])).cuda().float()
+    preds = eval_torch(net, frames, 6)
     print('Done.')
 
 from multiprocessing.pool import ThreadPool
