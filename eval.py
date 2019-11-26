@@ -24,7 +24,6 @@ import os
 from collections import defaultdict
 from pathlib import Path
 from collections import OrderedDict
-from PIL import Image
 
 import matplotlib.pyplot as plt
 import cv2
@@ -34,24 +33,26 @@ import zmq
 import random
 import glob
 
-port = "8000"
-context = zmq.Context()
-socket = context.socket(zmq.PUB)
-socket.bind("tcp://*:%s" % port)
 
-def publish_data(classes, scores, boxes, masks):
+def publish_data(classes, scores, boxes, masks, cam_name, frame_id):
     global socket
     pts = [mask2pts(i) for i in masks]
+    out_dict = {'detections': []}
+    if cam_name is not None:
+        out_dict['cam_name'] = cam_name
+    if frame_id is not None:
+        out_dict['frame_id'] = frame_id
+    N = len(classes)
+    for ind in range(N):
+        out_dict['detections'].append(
+            {'class': int(classes[ind]),
+             'score': float(scores[ind]),
+             'box': [int(i) for i in boxes[ind]],
+             'pts': pts[ind]
+            })
 
-    outstr = ''
-    for cat, score, (x1, y1, x2, y2), pt in zip(classes, scores, boxes, pts):
-        outstr += '{},{},{},{},{},{},{}\n'.format(cat, score, x1,y1,x2,y2, pt)
-    topic = "10001"
-    if outstr:
-        final = "{}:\t{}".format(topic, outstr)
-    else:
-        final = "{}:\tnone".format(topic)
-    socket.send_string(final)
+    msg = args.zmq_topic + ' ' + json.dumps(out_dict)
+    socket.send_string(msg)
 
 def str2bool(v):
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
@@ -139,10 +140,14 @@ def parse_args(argv=None):
                         help='When displaying / saving video, draw the FPS on the frame')
     parser.add_argument('--emulate_playback', default=False, dest='emulate_playback', action='store_true',
                         help='When saving a video, emulate the framerate that you\'d get running in real-time mode.')
-    parser.add_argument('--to_write', default=False, type=str2bool,
+    parser.add_argument('--to_publish', default=False, type=str2bool,
                         help='Whether or not to write the output data to a file')
     parser.add_argument('--to_display', default=True, type=str2bool,
                         help='Whether or not to display the video')
+    parser.add_argument('--port', default="8000", type=str,
+                        help="Which port to bind to to publish")
+    parser.add_argument('--zmq_topic', default="10001", type=str,
+                        help="Which topic to publish over zmq")
 
     parser.set_defaults(no_bar=False, display=False, resume=False, output_coco_json=False, output_web_json=False, shuffle=False,
                         benchmark=False, no_sort=False, no_hash=False, mask_proto_debug=False, crop=True, detect=False, display_fps=False,
@@ -162,7 +167,7 @@ coco_cats = {} # Call prep_coco_cats to fill this
 coco_cats_inv = {}
 color_cache = defaultdict(lambda: {})
 
-def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, mask_alpha=0.45, fps_str='', to_write=False):
+def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, mask_alpha=0.45, fps_str='', to_publish=False, cam_name=None, frame_id=None):
     """
     Note: If undo_transform=False then im_h and im_w are allowed to be None.
     """
@@ -186,8 +191,9 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
         classes, scores, boxes = [x[:args.top_k].cpu().numpy() for x in t[:3]]
 
     # jafek.ben TODO you can return here, no display
-    if to_write:
-        publish_data(classes, scores, boxes, masks)
+    if to_publish:
+        publish_data(classes, scores, boxes, masks, cam_name, frame_id)
+        return
 
     num_dets_to_consider = min(args.top_k, classes.shape[0])
     for j in range(num_dets_to_consider):
@@ -656,7 +662,17 @@ def mask2pts(mask):
     large = np.array(large).reshape(-1, 2).tolist()
     return large[::-1]
 
-def eval_torch(net:Yolact, images):
+def publish_preds(preds, cam_name, frame_id):
+    """
+    Publishes the preds over ZMQ
+    """
+    N = len(preds)
+    for ind in range(N):
+        p = preds[ind]
+        publish_data(p['class'], p['score'], p['box'], p['mask'],
+                     cam_name, frame_id)
+
+def eval_torch(net:Yolact, images, ts, cam_name=None):
     """
     Accepts a batched set of images and returns their segmentation maps.
     Args:
@@ -667,52 +683,47 @@ def eval_torch(net:Yolact, images):
                             W is the width of the images, and
                             the image has 3 color channels: BGR.
 
-    Returns 4 torch Tensors (in the following order):
+    Returns a list of length N, with each element representing the output of 1
+                    image and containing 4 torch Tensors (in the following order):
         - classes [num_det]: The class idx for each detection.
         - scores  [num_det]: The confidence score for each detection.
         - boxes   [num_det, 4]: The bounding box for each detection in absolute point form.
         - seg     [num_det]: Segmentation region in pixel coordinates
     """
-    start = time.time()
-    print (time.time() - start)
     N, H, W, D = images.shape
-    batch = FastBaseTransform()(images)
-    print (time.time() - start)
-    preds = net(batch)
-    print (time.time() - start)
-    output = []
-    for i in range(N):
-        classes, scores, boxes, masks = postprocess(preds, W, H, i, score_threshold=args.score_threshold)
-        one_line = [classes, scores, boxes]
-        num_dets = masks.shape[0]
-        segs = [mask2pts(masks[j]) for j in range(num_dets)]
-        one_line.append(segs)
-        output.append(one_line)
+    preds = net(images)
+    if cam_name is None:
+        cam_name='images {}'.format(args.port)
 
-    print (time.time() - start)
-    return output
+    if args.to_publish:
+        publish_preds(preds, cam_name, ts)
+    return [(p['class'], p['score'], p['box'], mask2pts(p['mask'])) for p in preds]
 
-def evalimages(net:Yolact, input_folder:str, output_folder:str):
+def evalimages(net:Yolact, input_folder:str, output_folder:str, N:int):
     if not os.path.exists(output_folder):
         os.mkdir(output_folder)
 
     print()
     fnames = []
-    for ind, p in enumerate(Path(input_folder).glob('*')):
-        if ind >= 6:
-            break
-        path = str(p)
-        fnames.append(path)
-        continue
+    net = CustomDataParallel(net).cuda()
+    transform = torch.nn.DataParallel(FastBaseTransform()).cuda()
+    while True:
+        for ind, p in enumerate(Path(input_folder).glob('*')):
+            print (ind)
+            if N == 1 or ind%N or ind==0:
+                # Accumulate
+                fnames.append(str(p))
 
-        name = os.path.basename(path)
-        name = '.'.join(name.split('.')[:-1]) + '.png'
-        out_path = os.path.join(output_folder, name)
-
-        evalimage(net, path, out_path)
-    frames = torch.from_numpy(np.array([cv2.imread(fname) for fname in fnames])).cuda().float()
-    preds = eval_torch(net, frames)
-    display_preds(preds, frames)
+                if N > 1:
+                    continue
+            frames = [torch.from_numpy(cv2.imread(fname)).cuda().float() for fname in fnames]
+            frames = transform(torch.stack(frames, 0))
+            start = time.time()
+            eval_torch(net, frames, 1e6*time.time())
+            if args.to_publish:
+                with open('results.txt', 'a') as f:
+                    f.write('{},{}\n'.format(args.video_multiframe, time.time() - start))
+            fnames = []
 
     print('Done.')
 
@@ -758,42 +769,53 @@ def evalframes(net:Yolact, imgfolder:str, out_path:str=None):
         exit()
 
     def transform_frame1(frames):
+        frames, cam_ids, timestamps = zip(*frames)
+        print ('before transform', time.time() - 1e-6*timestamps[-1])
         frames = [torch.from_numpy(frame).cuda().float() for frame in frames]
-        return frames, transform(torch.stack(frames, 0))
+        return frames, transform(torch.stack(frames, 0)), cam_ids, timestamps
 
     def get_next_frame1(files, start_idx):
         frames = []
         for idx in range(args.video_multiframe):
+            # "read" the metadata
             try:
-                frame = cv2.imread(files[start_idx + idx])
+                name = files[start_idx + idx]
             except IndexError:
                 continue
+
+            frame = cv2.imread(name)
             if frame is None:
                 return frames
-            frames.append(frame)
+
+            cam_name, timestamp = os.path.splitext(os.path.basename(name))[0].split('_')
+            timestamp = int(1e6*time.time())
+            frames.append((frame, cam_name, timestamp))
         return frames
 
     def eval_network1(inp):
         with torch.no_grad():
-            frames, imgs = inp
+            frames, imgs, cam_ids, timestamps = inp
             num_extra = 0
+            print ('before concat:', time.time() - 1e-6*timestamps[-1])
             while imgs.size(0) < args.video_multiframe:
                 imgs = torch.cat([imgs, imgs[0].unsqueeze(0)], dim=0)
                 num_extra += 1
+            print ('before inference', time.time() - 1e-6*timestamps[-1])
             out = net(imgs)
             if num_extra > 0:
                 out = out[:-num_extra]
-            return frames, out
+            return frames, out, cam_ids, timestamps
 
     def prep_frame1(inp, fps_str):
         with torch.no_grad():
-            frame, preds = inp
-            return prep_display(preds, frame, None, None, undo_transform=False, class_color=True, fps_str=fps_str, to_write=args.to_write)
+            frame, preds, cam_name, timestamp = inp
+            print ('before prep display', time.time() - 1e-6*timestamp)
+            return prep_display(preds, frame, None, None, undo_transform=False, class_color=True, fps_str=fps_str, to_publish=args.to_publish, cam_name=cam_name, frame_id=timestamp)
 
     frame_buffer = Queue()
     video_fps = 0
 
-    # All this timing code to make sure that
+    # All this timing code to make sure that the video looks smooth even if it can't be processed that fast.
     def play_video():
         try:
             nonlocal frame_buffer, running, video_fps, is_webcam, num_frames, frames_displayed, vid_done
@@ -806,6 +828,7 @@ def evalframes(net:Yolact, imgfolder:str, out_path:str=None):
 
             while running:
                 frame_time_start = time.time()
+                print ('BUFFER SIZE:', frame_buffer.qsize())
 
                 if not frame_buffer.empty():
                     next_time = time.time()
@@ -816,7 +839,6 @@ def evalframes(net:Yolact, imgfolder:str, out_path:str=None):
                         if args.to_display:
                             cv2.imshow(imgfolder, frame_buffer.get())
                     else:
-                        #out.write(frame_buffer.get())
                         out_name = os.path.join(out_path, 'img{}.png'.format(int(frame_time_start*1e6)))
                         cv2.imwrite(out_name, frame_buffer.get())
                     frames_displayed += 1
@@ -864,13 +886,19 @@ def evalframes(net:Yolact, imgfolder:str, out_path:str=None):
                 else:
                     # Let's not starve the main thread, now
                     time.sleep(0.001)
+
         except:
             # See issue #197 for why this is necessary
             import traceback
             traceback.print_exc()
 
 
-    extract_frame = lambda x, i: (x[0][i] if x[1][i] is None else x[0][i].to(x[1][i]['box'].device), [x[1][i]])
+    def extract_frame1(x, i):
+        print ('before extraction', time.time() - 1e-6*x[3][i])
+        return (x[0][i] if x[1][i] is None else x[0][i].to(x[1][i]['box'].device),
+                [x[1][i]],
+                x[2][i],  # cam_name
+                x[3][i])  # timestamp
 
     # Prime the network on the first frame because I do some thread unsafe things otherwise
     print('Initializing model... ', end='')
@@ -881,15 +909,14 @@ def evalframes(net:Yolact, imgfolder:str, out_path:str=None):
     sequence = [prep_frame1, eval_network1, transform_frame1]
     pool = ThreadPool(processes=len(sequence) + args.video_multiframe + 2)
     pool.apply_async(play_video)
-    # TODO(jafek.ben) must update if adding camera ID
-    active_frames = [{'value': extract_frame(first_batch, i), 'idx': 0, 'timestamp': 1e6*time.time()} for i in range(len(first_batch[0]))]
+    active_frames = [{'value': extract_frame1(first_batch, i), 'idx': 0} for i in range(len(first_batch[0]))]
 
     print()
     if out_path is None: print('Press Escape to close.')
     try:
         overall_idx = 0
         while running:
-            overall_idx = (overall_idx + args.video_multiframe) % num_frames
+            overall_idx = (overall_idx + args.video_multiframe) % (num_frames - args.video_multiframe)
             # Hard limit on frames in buffer so we don't run out of memory >.>
             while frame_buffer.qsize() > 30:  # TODO
                 time.sleep(0.001)
@@ -919,16 +946,15 @@ def evalframes(net:Yolact, imgfolder:str, out_path:str=None):
                 # Remove the finished frames from the processing queue
                 active_frames = [x for x in active_frames if x['idx'] > 0]
 
-                # Finish evaluating every frame in the processing queue and advanced their position in the sequence
+                # Finish evaluating every frame in the processing queue and advance their position in the sequence
                 for frame in list(reversed(active_frames)):
                     frame['value'] = frame['value'].get()
                     frame['idx'] -= 1
 
                     if frame['idx'] == 0:
                         # Split this up into individual threads for prep_frame since it doesn't support batch size
-                        # TODO(jafek.ben) must update if adding camera ID
-                        active_frames += [{'value': extract_frame(frame['value'], i), 'idx': 0, 'timestamp': 1e6*time.time()} for i in range(1, len(frame['value'][0]))]
-                        frame['value'] = extract_frame(frame['value'], 0)
+                        active_frames += [{'value': extract_frame1(frame['value'], i), 'idx': 0} for i in range(1, len(frame['value'][0]))]
+                        frame['value'] = extract_frame1(frame['value'], 0)
 
                 # Finish loading in the next frames and add them to the processing queue
                 if next_frames is not None:
@@ -936,8 +962,7 @@ def evalframes(net:Yolact, imgfolder:str, out_path:str=None):
                     if len(frames) == 0:
                         vid_done = True
                     else:
-                        # TODO(jafek.ben) must update if adding camera ID
-                        active_frames.append({'value': frames, 'idx': len(sequence)-1, 'timestamp': 1e6*time.time()})
+                        active_frames.append({'value': frames, 'idx': len(sequence)-1})
 
                 # Compute FPS
                 frame_times.add(time.time() - start_time)
@@ -946,8 +971,11 @@ def evalframes(net:Yolact, imgfolder:str, out_path:str=None):
                 fps = 0
 
             fps_str = 'Processing FPS: %.2f | Video Playback FPS: %.2f | Frames in Buffer: %d' % (fps, video_fps, frame_buffer.qsize())
+            print ('TOTAL', time.time() - start_time)
             if not args.display_fps:
-                print('\r' + fps_str + '    ', end='')
+                #print('\r' + fps_str + '    ', end='')
+                print (fps_str)
+                print('')
 
     except KeyboardInterrupt:
         print('\nStopping...')
@@ -1008,17 +1036,18 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
             frame = vid.read()[1]
             if frame is None:
                 return frames
-            frames.append(frame)
+            frames.append((frame, 1e6*time.time()))
         return frames
 
     def transform_frame(frames):
         with torch.no_grad():
-            frames = [torch.from_numpy(frame).cuda().float() for frame in frames]
-            return frames, transform(torch.stack(frames, 0))
+            imgs, timestamps = zip(*frames)
+            frames = [torch.from_numpy(img).cuda().float() for img in imgs]
+            return frames, transform(torch.stack(frames, 0)), timestamps
 
     def eval_network(inp):
         with torch.no_grad():
-            frames, imgs = inp
+            frames, imgs, timestamps = inp
             num_extra = 0
             while imgs.size(0) < args.video_multiframe:
                 imgs = torch.cat([imgs, imgs[0].unsqueeze(0)], dim=0)
@@ -1026,12 +1055,12 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
             out = net(imgs)
             if num_extra > 0:
                 out = out[:-num_extra]
-            return frames, out
+            return frames, out, timestamps
 
     def prep_frame(inp, fps_str):
         with torch.no_grad():
-            frame, preds = inp
-            return prep_display(preds, frame, None, None, undo_transform=False, class_color=True, fps_str=fps_str, to_write=args.to_write)
+            frame, preds, timestamp = inp
+            return prep_display(preds, frame, None, None, undo_transform=False, class_color=True, fps_str=fps_str, to_publish=args.to_publish, cam_name='video {}'.format(args.port), frame_id=timestamp)
 
     frame_buffer = Queue()
     video_fps = 0
@@ -1109,7 +1138,10 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
             traceback.print_exc()
 
 
-    extract_frame = lambda x, i: (x[0][i] if x[1][i] is None else x[0][i].to(x[1][i]['box'].device), [x[1][i]])
+    def extract_frame(x, i):
+        return (x[0][i] if x[1][i] is None else x[0][i].to(x[1][i]['box'].device),
+                [x[1][i]],
+                x[2][i])  # timestamp
 
     # Prime the network on the first frame because I do some thread unsafe things otherwise
     print('Initializing model... ', end='')
@@ -1120,8 +1152,7 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
     sequence = [prep_frame, eval_network, transform_frame]
     pool = ThreadPool(processes=len(sequence) + args.video_multiframe + 2)
     pool.apply_async(play_video)
-    # TODO(jafek.ben) must update if adding camera ID
-    active_frames = [{'value': extract_frame(first_batch, i), 'idx': 0, 'timestamp': 1e6*time.time()} for i in range(len(first_batch[0]))]
+    active_frames = [{'value': extract_frame(first_batch, i), 'idx': 0} for i in range(len(first_batch[0]))]
 
     print()
     if out_path is None: print('Press Escape to close.')
@@ -1163,8 +1194,7 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
 
                     if frame['idx'] == 0:
                         # Split this up into individual threads for prep_frame since it doesn't support batch size
-                        # TODO(jafek.ben) must update if adding camera ID
-                        active_frames += [{'value': extract_frame(frame['value'], i), 'idx': 0, 'timestamp': 1e6*time.time()} for i in range(1, len(frame['value'][0]))]
+                        active_frames += [{'value': extract_frame(frame['value'], i), 'idx': 0} for i in range(1, len(frame['value'][0]))]
                         frame['value'] = extract_frame(frame['value'], 0)
 
                 # Finish loading in the next frames and add them to the processing queue
@@ -1173,8 +1203,7 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
                     if len(frames) == 0:
                         vid_done = True
                     else:
-                        # TODO(jafek.ben) must update if adding camera ID
-                        active_frames.append({'value': frames, 'idx': len(sequence)-1, 'timestamp': 1e6*time.time()})
+                        active_frames.append({'value': frames, 'idx': len(sequence)-1})
 
                 # Compute FPS
                 frame_times.add(time.time() - start_time)
@@ -1205,7 +1234,7 @@ def evaluate(net:Yolact, dataset, train_mode=False):
         return
     elif args.images is not None:
         inp, out = args.images.split(':')
-        evalimages(net, inp, out)
+        evalimages(net, inp, out, args.video_multiframe)
         return
     elif args.video is not None:
         if ':' in args.video:
@@ -1402,6 +1431,11 @@ if __name__ == '__main__':
     if args.dataset is not None:
         set_dataset(args.dataset)
 
+    if args.to_publish:
+        context = zmq.Context()
+        socket = context.socket(zmq.PUB)
+        socket.bind("tcp://*:%s" % args.port)
+
     with torch.no_grad():
         if not os.path.exists('results'):
             os.makedirs('results')
@@ -1418,7 +1452,7 @@ if __name__ == '__main__':
             calc_map(ap_data)
             exit()
 
-        if args.image is None and args.video is None and args.images is None:
+        if args.image is None and args.video is None and args.images is None and args.other_images is None:
             dataset = COCODetection(cfg.dataset.valid_images, cfg.dataset.valid_info,
                                     transform=BaseTransform(), has_gt=cfg.dataset.has_gt)
             prep_coco_cats()
