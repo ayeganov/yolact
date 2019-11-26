@@ -1208,13 +1208,18 @@ def evaluate(net:Yolact, dataset, train_mode=False):
         evalimages(net, inp, out)
         return
     elif args.video is not None:
+        if ':' in args.video:
+            inp, out = args.video.split(':')
+            evalvideo(net, inp, out)
+        else:
+            evalvideo(net, args.video)
+        return
+    elif args.other_images is not None:
         imgfolder = args.other_images
         if ':' in imgfolder:
             inp, out = imgfolder.split(':')
-            #evalvideo(net, inp, out)
             evalframes(net, inp, out)
         else:
-            #evalvideo(net, args.video)
             evalframes(net, imgfolder)
         return
 
