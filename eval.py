@@ -6,6 +6,7 @@ from layers.box_utils import jaccard, center_size, mask_iou
 from utils import timer
 from utils.functions import SavePath
 from layers.output_utils import postprocess, undo_image_transformation
+from layers.box_utils import sanitize_coordinates
 import pycocotools
 
 from data import cfg, set_cfg, set_dataset
@@ -42,11 +43,14 @@ def publish_data(classes, scores, boxes, masks, cam_name, frame_id):
     if frame_id is not None:
         out_dict['frame_id'] = frame_id
     N = len(classes)
+    boxes[:, 0], boxes[:, 2] = sanitize_coordinates(boxes[:, 0], boxes[:, 2], 1920, cast=False)
+    boxes[:, 1], boxes[:, 3] = sanitize_coordinates(boxes[:, 1], boxes[:, 3], 1080, cast=False)
+    boxes = boxes.long().tolist()
     for ind in range(N):
         out_dict['detections'].append(
             {'class': int(classes[ind]),
              'score': float(scores[ind]),
-             'box': [int(i) for i in boxes[ind]],
+             'box': boxes[ind],
              'pts': pts[ind]
             })
 
