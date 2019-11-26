@@ -24,5 +24,10 @@ total_value = 0
 while True:
     string = socket.recv().decode('utf-8')
     topic, message = string.split(':\t')
-    data = message.split('\n')
-    print (topic, len(data))
+    data = message.strip().split('\n')
+    try:
+        data.remove('none')
+    except:
+        pass
+
+    print ('{}\t-\tdetections:\t{}'.format(topic, len(data)))
