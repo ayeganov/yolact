@@ -33,7 +33,6 @@ import zmq
 import random
 import glob
 
-
 def publish_data(classes, scores, boxes, masks, cam_name, frame_id):
     global socket
     pts = [mask2pts(i) for i in masks]
@@ -672,7 +671,7 @@ def publish_preds(preds, cam_name, frame_id):
         publish_data(p['class'], p['score'], p['box'], p['mask'],
                      cam_name, frame_id)
 
-def eval_torch(net:Yolact, images, ts, cam_name=None):
+def eval_torch(net:Yolact, images, frame_id, cam_name=None):
     """
     Accepts a batched set of images and returns their segmentation maps.
     Args:
@@ -682,6 +681,12 @@ def eval_torch(net:Yolact, images, ts, cam_name=None):
                             H is the height of the images,
                             W is the width of the images, and
                             the image has 3 color channels: BGR.
+        - frame_id: An identifier for the incoming frame, usually the timestamp
+                    at which it was received.
+        - cam_name: An identifier for the camera which published these images.
+                    If no name is given, the ZMQ publisher will publish the
+                    name as the name of the port over which the predictions will
+                    be sent.
 
     Returns a list of length N, with each element representing the output of 1
                     image and containing 4 torch Tensors (in the following order):
@@ -690,13 +695,14 @@ def eval_torch(net:Yolact, images, ts, cam_name=None):
         - boxes   [num_det, 4]: The bounding box for each detection in absolute point form.
         - seg     [num_det]: Segmentation region in pixel coordinates
     """
+
     N, H, W, D = images.shape
     preds = net(images)
     if cam_name is None:
         cam_name='images {}'.format(args.port)
 
     if args.to_publish:
-        publish_preds(preds, cam_name, ts)
+        publish_preds(preds, cam_name, frame_id)
     return [(p['class'], p['score'], p['box'], mask2pts(p['mask'])) for p in preds]
 
 def evalimages(net:Yolact, input_folder:str, output_folder:str, N:int):
@@ -719,10 +725,7 @@ def evalimages(net:Yolact, input_folder:str, output_folder:str, N:int):
             frames = [torch.from_numpy(cv2.imread(fname)).cuda().float() for fname in fnames]
             frames = transform(torch.stack(frames, 0))
             start = time.time()
-            eval_torch(net, frames, 1e6*time.time())
-            if args.to_publish:
-                with open('results.txt', 'a') as f:
-                    f.write('{},{}\n'.format(args.video_multiframe, time.time() - start))
+            eval_torch(net, frames, 1e6*time.time(), str(args.video_multiframe))
             fnames = []
 
     print('Done.')

@@ -47,6 +47,8 @@ try:
 
 except KeyboardInterrupt:
     for k in delays:
+        with open('timing_results.txt', 'a') as f:
+            f.write('{}:\t{}\n'.format(k, ','.join([str(i) for i in delays[k]])))
         plt.hist(delays[k], bins=np.arange(0, 0.75, 0.025), label=k)
 
     plt.xlim([0, 0.3])

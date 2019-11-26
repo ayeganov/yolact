@@ -161,4 +161,4 @@ _.py
 # other things
 *.swp
 *.png
-results.txt
+*results.txt
