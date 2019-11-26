@@ -710,7 +710,7 @@ def eval_torch(net:Yolact, images, frame_id, cam_name=None):
     return [(p['class'], p['score'], p['box'], mask2pts(p['mask'])) for p in preds]
 
 def evalimages(net:Yolact, input_folder:str, output_folder:str, N:int):
-    if not os.path.exists(output_folder):
+    if output_folder and not os.path.exists(output_folder):
         os.mkdir(output_folder)
 
     print()
@@ -1240,7 +1240,11 @@ def evaluate(net:Yolact, dataset, train_mode=False):
             evalimage(net, args.image)
         return
     elif args.images is not None:
-        inp, out = args.images.split(':')
+        if ':' in args.images:
+            inp, out = args.images.split(':')
+        else:
+            inp = args.images
+            out = ''
         evalimages(net, inp, out, args.video_multiframe)
         return
     elif args.video is not None:
