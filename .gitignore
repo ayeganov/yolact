@@ -157,3 +157,8 @@ vid/
 vidres/
 
 _.py
+
+# other things
+*.swp
+*.png
+results.txt
