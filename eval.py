@@ -34,13 +34,12 @@ import time
 import zmq
 import random
 import glob
-import pickle
+from pprint import pprint
 
 def publish_preds(preds, cam_name, frame_id, H, W):
     """
     Publishes the preds over ZMQ
     """
-    start = time.time()
     N = len(preds)
     for ind in range(N):
         p = preds[ind]
@@ -61,7 +60,6 @@ def publish_data(classes, scores, boxes, masks, H, W, cam_name=None, frame_id=No
 
     # How to capture the segmentation mask efficiently?
     new_masks = cfg.mask_proto_mask_activation(torch.matmul(proto, masks.t()))
-    masks = masks.tolist()
     boxes[:, 0], boxes[:, 2] = sanitize_coordinates(boxes[:, 0], boxes[:, 2], W, cast=False)
     boxes[:, 1], boxes[:, 3] = sanitize_coordinates(boxes[:, 1], boxes[:, 3], H, cast=False)
     boxes = boxes.long().tolist()
@@ -76,6 +74,11 @@ def publish_data(classes, scores, boxes, masks, H, W, cam_name=None, frame_id=No
             })
 
     msg = args.zmq_topic + ' ' + json.dumps(out_dict)
+    socket.send_string(msg)
+
+def publish_final(final):
+    global socket
+    msg = args.zmq_topic + ' ' + json.dumps(final)
     socket.send_string(msg)
 
 def str2bool(v):
@@ -152,8 +155,8 @@ def parse_args(argv=None):
                         help='An input folder of images and output folder to save detected images. Should be in the format input->output.')
     parser.add_argument('--video', default=None, type=str,
                         help='A path to a video to evaluate on. Passing in a number will use that index webcam.')
-    parser.add_argument('--video_multiframe', default=1, type=int,
-                        help='The number of frames to evaluate in parallel to make videos play at higher fps.')
+    parser.add_argument('--num_multiframe', default=1, type=int,
+                        help='The number of frames to receive in parallel.')
     parser.add_argument('--score_threshold', default=0.05, type=float,
                         help='Detections with a score under this threshold will not be considered. This currently only works in display mode.')
     parser.add_argument('--dataset', default=None, type=str,
@@ -206,6 +209,10 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
         t = postprocess(dets_out, w, h, visualize_lincomb = args.display_lincomb,
                                         crop_masks        = args.crop,
                                         score_threshold   = args.score_threshold)
+        for i in t:
+            pprint (i.shape)
+            pprint(i)
+            print ('')
         torch.cuda.synchronize()
 
     with timer.env('Copy'):
@@ -679,7 +686,7 @@ def evalimage(net:Yolact, path:str, save_path:str=None):
     else:
         cv2.imwrite(save_path, img_numpy)
 
-def eval_torch(net:Yolact, images, frame_id, cam_name=None):
+def eval_torch(net, images, H, W, frame_id, cam_name=None):
     """
     Accepts a batched set of images and returns their segmentation maps.
     Args:
@@ -703,16 +710,74 @@ def eval_torch(net:Yolact, images, frame_id, cam_name=None):
         - boxes   [num_det, 4]: The bounding box for each detection in absolute point form.
         - seg     [num_det]: Segmentation region in pixel coordinates
     """
-    N, D, H, W = images.shape
     preds = net(images)
     if cam_name is None:
-        cam_name='images {}'.format(args.port)
+       cam_name='images {}'.format(args.port)
+    final = preds2final(preds, frame_id, H, W, cam_name)
 
     if args.to_publish:
-        publish_preds(preds, cam_name, frame_id, 1080, 1920)
-    return [(p['class'], p['score'], p['box'], mask2pts(p['mask'])) for p in preds]
+        publish_final(final)
+    return final
 
-def evalimages(net:Yolact, input_folder:str, output_folder:str, N:int):
+def preds2final(preds, frame_id, H, W, sensor_id=None):
+    """
+    Get the output in the format we want.
+    Args:
+        preds:
+            list of size args.multiframe, where each element represents the
+            output from a single input image
+
+    Returns:
+        final:
+            list of size args.multiframe, where each element represents the
+            output from a single input image
+    """
+    final = {'detections': [],
+             'frame_id': frame_id,
+             'sensor_id': sensor_id}
+
+    for p in preds:
+        cur_image = {}
+        # Scores
+        scores = p['score']
+        keep = scores > args.score_threshold
+        cur_image['score'] = scores.tolist()
+
+        # Categories
+        cur_image['class'] = p['class'][keep].tolist()
+
+        # Mask
+        boxes = p['box'][keep]
+        masks = p['mask']
+        masks = masks[keep]
+        proto = p['proto']
+        masks = torch.matmul(proto, masks.t())
+        masks = cfg.mask_proto_mask_activation(masks)
+        masks = crop(masks, boxes)
+        masks = masks.permute(2, 0, 1).contiguous()
+        masks = F.interpolate(masks.unsqueeze(0), (H, W), mode='bilinear', align_corners=False).squeeze(0)
+        masks.gt_(0.5)
+
+        # Bounding boxes
+        boxes[:, 0], boxes[:, 2] = sanitize_coordinates(boxes[:, 0], boxes[:, 2], W, cast=False)
+        boxes[:, 1], boxes[:, 3] = sanitize_coordinates(boxes[:, 1], boxes[:, 3], H, cast=False)
+        boxes = boxes.long().tolist()
+        cur_image['box'] = boxes
+
+        # Then crop masks
+        # NOTE: this is BY FAR the slowest part of the full inference.
+        outmasks = []
+        for mask, box in zip(masks, boxes):
+            x1, y1, x2, y2 = box
+            outmask = mask.cpu().bool().numpy()[y1:y2, x1:x2]
+            outmasks.append(outmask.tolist())
+        cur_image['mask'] = outmasks
+
+        # And append
+        final['detections'].append(cur_image)
+    return final
+
+def evalimages(net:Yolact, input_folder:str, output_folder:str):
     if output_folder and not os.path.exists(output_folder):
         os.mkdir(output_folder)
 
@@ -721,16 +786,18 @@ def evalimages(net:Yolact, input_folder:str, output_folder:str, N:int):
     transform = torch.nn.DataParallel(FastBaseTransform()).cuda()
     while True:
         for ind, p in enumerate(Path(input_folder).glob('*')):
-            if N == 1 or ind%N or ind==0:
-                # Accumulate
+            if args.num_multiframe == 1 or ind%args.num_multiframe or ind == 0:
                 fnames.append(str(p))
 
-                if N > 1:
+                if args.num_multiframe > 1:
                     continue
+
             frames = [torch.from_numpy(cv2.imread(fname)).cuda().float() for fname in fnames]
+            H, W, _ = frames[0].shape
             frames = transform(torch.stack(frames, 0))
             start = time.time()
-            eval_torch(net, frames, 1e6*time.time(), str(args.video_multiframe))
+            final = eval_torch(net, frames, H, W,
+                               1e6*time.time(), str(args.num_multiframe))
             fnames = []
     print('Done.')
 
@@ -783,7 +850,7 @@ def evalframes(net:Yolact, imgfolder:str, out_path:str=None):
 
     def get_next_frame1(files, start_idx):
         frames = []
-        for idx in range(args.video_multiframe):
+        for idx in range(args.num_multiframe):
             # "read" the metadata
             try:
                 name = files[start_idx + idx]
@@ -804,7 +871,7 @@ def evalframes(net:Yolact, imgfolder:str, out_path:str=None):
             frames, imgs, cam_ids, timestamps = inp
             num_extra = 0
             print ('before concat:', time.time() - 1e-6*timestamps[-1])
-            while imgs.size(0) < args.video_multiframe:
+            while imgs.size(0) < args.num_multiframe:
                 imgs = torch.cat([imgs, imgs[0].unsqueeze(0)], dim=0)
                 num_extra += 1
             print ('before inference', time.time() - 1e-6*timestamps[-1])
@@ -872,9 +939,9 @@ def evalframes(net:Yolact, imgfolder:str, out_path:str=None):
 
                 if not vid_done:
                     buffer_size = frame_buffer.qsize()
-                    if buffer_size < args.video_multiframe:
+                    if buffer_size < args.num_multiframe:
                         frame_time_stabilizer += stabilizer_step
-                    elif buffer_size > args.video_multiframe:
+                    elif buffer_size > args.num_multiframe:
                         frame_time_stabilizer -= stabilizer_step
                         if frame_time_stabilizer < 0:
                             frame_time_stabilizer = 0
@@ -914,7 +981,7 @@ def evalframes(net:Yolact, imgfolder:str, out_path:str=None):
 
     # For each frame the sequence of functions it needs to go through to be processed (in reversed order)
     sequence = [prep_frame1, eval_network1, transform_frame1]
-    pool = ThreadPool(processes=len(sequence) + args.video_multiframe + 2)
+    pool = ThreadPool(processes=len(sequence) + args.num_multiframe + 2)
     pool.apply_async(play_video)
     active_frames = [{'value': extract_frame1(first_batch, i), 'idx': 0} for i in range(len(first_batch[0]))]
 
@@ -923,7 +990,7 @@ def evalframes(net:Yolact, imgfolder:str, out_path:str=None):
     try:
         overall_idx = 0
         while running:
-            overall_idx = (overall_idx + args.video_multiframe) % (num_frames - args.video_multiframe)
+            overall_idx = (overall_idx + args.num_multiframe) % (num_frames - args.num_multiframe)
             # Hard limit on frames in buffer so we don't run out of memory >.>
             while frame_buffer.qsize() > 30:  # TODO
                 time.sleep(0.001)
@@ -973,7 +1040,7 @@ def evalframes(net:Yolact, imgfolder:str, out_path:str=None):
 
                 # Compute FPS
                 frame_times.add(time.time() - start_time)
-                fps = args.video_multiframe / frame_times.get_avg()
+                fps = args.num_multiframe / frame_times.get_avg()
             else:
                 fps = 0
 
@@ -1039,7 +1106,7 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
 
     def get_next_frame(vid):
         frames = []
-        for idx in range(args.video_multiframe):
+        for idx in range(args.num_multiframe):
             frame = vid.read()[1]
             if frame is None:
                 return frames
@@ -1056,7 +1123,7 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
         with torch.no_grad():
             frames, imgs, timestamps = inp
             num_extra = 0
-            while imgs.size(0) < args.video_multiframe:
+            while imgs.size(0) < args.num_multiframe:
                 imgs = torch.cat([imgs, imgs[0].unsqueeze(0)], dim=0)
                 num_extra += 1
             out = net(imgs)
@@ -1118,9 +1185,9 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
 
                 if not vid_done:
                     buffer_size = frame_buffer.qsize()
-                    if buffer_size < args.video_multiframe:
+                    if buffer_size < args.num_multiframe:
                         frame_time_stabilizer += stabilizer_step
-                    elif buffer_size > args.video_multiframe:
+                    elif buffer_size > args.num_multiframe:
                         frame_time_stabilizer -= stabilizer_step
                         if frame_time_stabilizer < 0:
                             frame_time_stabilizer = 0
@@ -1157,7 +1224,7 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
 
     # For each frame the sequence of functions it needs to go through to be processed (in reversed order)
     sequence = [prep_frame, eval_network, transform_frame]
-    pool = ThreadPool(processes=len(sequence) + args.video_multiframe + 2)
+    pool = ThreadPool(processes=len(sequence) + args.num_multiframe + 2)
     pool.apply_async(play_video)
     active_frames = [{'value': extract_frame(first_batch, i), 'idx': 0} for i in range(len(first_batch[0]))]
 
@@ -1214,7 +1281,7 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
 
                 # Compute FPS
                 frame_times.add(time.time() - start_time)
-                fps = args.video_multiframe / frame_times.get_avg()
+                fps = args.num_multiframe / frame_times.get_avg()
             else:
                 fps = 0
             
@@ -1245,7 +1312,7 @@ def evaluate(net:Yolact, dataset, train_mode=False):
         else:
             inp = args.images
             out = ''
-        evalimages(net, inp, out, args.video_multiframe)
+        evalimages(net, inp, out)
         return
     elif args.video is not None:
         if ':' in args.video:
@@ -1415,8 +1482,6 @@ def print_maps(all_maps):
         print(make_row([iou_type] + ['%.2f' % x if x < 100 else '%.1f' % x for x in all_maps[iou_type].values()]))
     print(make_sep(len(all_maps['box']) + 1))
     print()
-
-
 
 if __name__ == '__main__':
     parse_args()
