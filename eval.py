@@ -6,13 +6,14 @@ from layers.box_utils import jaccard, center_size, mask_iou
 from utils import timer
 from utils.functions import SavePath
 from layers.output_utils import postprocess, undo_image_transformation
-from layers.box_utils import sanitize_coordinates
 import pycocotools
+from layers.box_utils import crop, sanitize_coordinates
 
 from data import cfg, set_cfg, set_dataset
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 from torch.autograd import Variable
 import argparse
@@ -33,25 +34,45 @@ import time
 import zmq
 import random
 import glob
+import pickle
 
-def publish_data(classes, scores, boxes, masks, cam_name, frame_id):
-    global socket
-    pts = [mask2pts(i) for i in masks]
-    out_dict = {'detections': []}
-    if cam_name is not None:
-        out_dict['cam_name'] = cam_name
-    if frame_id is not None:
-        out_dict['frame_id'] = frame_id
-    N = len(classes)
-    boxes[:, 0], boxes[:, 2] = sanitize_coordinates(boxes[:, 0], boxes[:, 2], 1920, cast=False)
-    boxes[:, 1], boxes[:, 3] = sanitize_coordinates(boxes[:, 1], boxes[:, 3], 1080, cast=False)
-    boxes = boxes.long().tolist()
+def publish_preds(preds, cam_name, frame_id, H, W):
+    """
+    Publishes the preds over ZMQ
+    """
+    start = time.time()
+    N = len(preds)
     for ind in range(N):
+        p = preds[ind]
+        keep = p['score'] > args.score_threshold
+        publish_data(p['class'][keep], p['score'][keep],
+                     p['box'][keep], p['mask'][keep], H, W,
+                     cam_name, frame_id, p['proto'])
+    print ('Message sent')
+
+def publish_data(classes, scores, boxes, masks, H, W, cam_name=None, frame_id=None, proto=None):
+    global socket
+    out_dict = {'detections': [],
+                'cam_name': cam_name,
+                'frame_id': frame_id,
+                'img_height': H,
+                'img_width': W}
+    N = len(classes)
+
+    # How to capture the segmentation mask efficiently?
+    new_masks = cfg.mask_proto_mask_activation(torch.matmul(proto, masks.t()))
+    masks = masks.tolist()
+    boxes[:, 0], boxes[:, 2] = sanitize_coordinates(boxes[:, 0], boxes[:, 2], W, cast=False)
+    boxes[:, 1], boxes[:, 3] = sanitize_coordinates(boxes[:, 1], boxes[:, 3], H, cast=False)
+    boxes = boxes.long().tolist()
+    start = time.time()
+    for ind in range(N):
+        m = new_masks[:,:,ind].tolist() # This serialization is too slow...
         out_dict['detections'].append(
             {'class': int(classes[ind]),
              'score': float(scores[ind]),
              'box': boxes[ind],
-             'pts': pts[ind]
+             'mask': m,
             })
 
     msg = args.zmq_topic + ' ' + json.dumps(out_dict)
@@ -69,7 +90,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description='YOLACT COCO Evaluation')
     parser.add_argument('--trained_model',
-                        default='/home/ben/yolact/weights/yolact_im700_54_800000.pth', type=str,
+                        default='/home/ben/yolact/weights/yolact_resnet50_54_800000.pth', type=str,
                         help='Trained state_dict file path to open. If "interrupt", this will open the interrupt file.')
     parser.add_argument('--top_k', default=5, type=int,
                         help='Further restrict the number of predictions to parse')
@@ -133,7 +154,7 @@ def parse_args(argv=None):
                         help='A path to a video to evaluate on. Passing in a number will use that index webcam.')
     parser.add_argument('--video_multiframe', default=1, type=int,
                         help='The number of frames to evaluate in parallel to make videos play at higher fps.')
-    parser.add_argument('--score_threshold', default=0, type=float,
+    parser.add_argument('--score_threshold', default=0.05, type=float,
                         help='Detections with a score under this threshold will not be considered. This currently only works in display mode.')
     parser.add_argument('--dataset', default=None, type=str,
                         help='If specified, override the dataset specified in the config with this one (example: coco2017_dataset).')
@@ -658,23 +679,6 @@ def evalimage(net:Yolact, path:str, save_path:str=None):
     else:
         cv2.imwrite(save_path, img_numpy)
 
-def mask2pts(mask):
-    cur_mask = mask.cpu().numpy().astype(np.uint8)*255
-    _, pts, _ = cv2.findContours(cur_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    large = max(pts, key=cv2.contourArea, default=[])
-    large = np.array(large).reshape(-1, 2).tolist()
-    return large[::-1]
-
-def publish_preds(preds, cam_name, frame_id):
-    """
-    Publishes the preds over ZMQ
-    """
-    N = len(preds)
-    for ind in range(N):
-        p = preds[ind]
-        publish_data(p['class'], p['score'], p['box'], p['mask'],
-                     cam_name, frame_id)
-
 def eval_torch(net:Yolact, images, frame_id, cam_name=None):
     """
     Accepts a batched set of images and returns their segmentation maps.
@@ -699,27 +703,24 @@ def eval_torch(net:Yolact, images, frame_id, cam_name=None):
         - boxes   [num_det, 4]: The bounding box for each detection in absolute point form.
         - seg     [num_det]: Segmentation region in pixel coordinates
     """
-
-    N, H, W, D = images.shape
+    N, D, H, W = images.shape
     preds = net(images)
     if cam_name is None:
         cam_name='images {}'.format(args.port)
 
     if args.to_publish:
-        publish_preds(preds, cam_name, frame_id)
+        publish_preds(preds, cam_name, frame_id, 1080, 1920)
     return [(p['class'], p['score'], p['box'], mask2pts(p['mask'])) for p in preds]
 
 def evalimages(net:Yolact, input_folder:str, output_folder:str, N:int):
     if output_folder and not os.path.exists(output_folder):
         os.mkdir(output_folder)
 
-    print()
     fnames = []
     net = CustomDataParallel(net).cuda()
     transform = torch.nn.DataParallel(FastBaseTransform()).cuda()
     while True:
         for ind, p in enumerate(Path(input_folder).glob('*')):
-            print (ind)
             if N == 1 or ind%N or ind==0:
                 # Accumulate
                 fnames.append(str(p))
@@ -731,7 +732,6 @@ def evalimages(net:Yolact, input_folder:str, output_folder:str, N:int):
             start = time.time()
             eval_torch(net, frames, 1e6*time.time(), str(args.video_multiframe))
             fnames = []
-
     print('Done.')
 
 from multiprocessing.pool import ThreadPool
