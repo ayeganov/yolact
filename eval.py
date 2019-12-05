@@ -741,7 +741,7 @@ def preds2final(preds, frame_id, H, W, sensor_id=None):
         # Scores
         scores = p['score']
         keep = scores > args.score_threshold
-        cur_image['score'] = scores.tolist()
+        cur_image['score'] = scores[keep].tolist()
 
         # Categories
         cur_image['class'] = p['class'][keep].tolist()
