@@ -1,0 +1,337 @@
+#!/usr/bin/env python
+'''
+This modules serves the application responsible for routing events from ROS to
+the DNN process running in Python 3.
+'''
+import abc
+import argparse
+import functools
+import logging
+import signal
+import sys
+import time
+import traceback
+
+from logzero import logger
+from tornado import ioloop, gen
+import bunch
+import logzero
+import numpy as np
+import torch
+
+from eval import CustomDataParallel
+from netpool import NetworkProcessPool
+import comm
+import wraploop
+
+
+class FactoryException(Exception):
+    '''
+    Raise when trying to create an unknown entity
+    '''
+
+
+class Collector(metaclass=abc.ABCMeta):
+    '''
+    This defines the interface for the collector objects that make a decision
+    when to run the inference.
+
+    The interface consists of two main methods:
+        collect - contains the logic to accept new incoming data
+        ready_to_infer - contains the logic to decide when enough is data
+                         collected to run the inference
+    '''
+    @abc.abstractmethod
+    def collect(self, source, data):
+        '''
+        Add new data point to this collector
+
+        @param source - a unique string indicating the source of this data. IE: Camera FL, Camera FR etc
+        @param data - data this collector is assembling, image, lidar point cloud, radar etc
+        '''
+
+    @abc.abstractproperty
+    def is_ready_to_infer(self):
+        '''
+        Analyze the data collected so far and return True if there is enough to
+        run inference, False otherwise.
+        '''
+
+    @abc.abstractmethod
+    def run_inference(self, network):
+        '''
+        Transform the data collected so far and run the inference
+
+        @param network - network on which to run the inference with the collected data
+        @returns result of the inference
+        '''
+
+
+class ImageCollector(Collector):
+    '''
+    Collect images coming from the receiver, concatenate them and run through the network inference
+    '''
+    def __init__(self, sources, loop):
+        '''
+        Initialize a new instance of the Collector
+
+        @param sources - a set containing unique strings representing image sources
+        @param loop - instance IOLoop
+        '''
+        self._sources = sources
+        self._loop = loop
+        self._latest_images = {}
+        self._future_inference = None
+        self._running_inference = False
+
+    @property
+    def is_ready_to_infer(self):
+        '''
+        Check if all images have been received, and can be run through the inference.
+        True if images ready and inference is not being run right now, False otherwise.
+        '''
+        all_sources_provided_data = all(s in self._latest_images for s in self._sources)
+        return not self._running_inference and all_sources_provided_data
+
+    def collect(self, source, image):
+        '''
+        Collect the image from the provided source
+        '''
+        self._latest_images[source] = image
+
+    def run_inference(self, network):
+        '''
+        Execute the inference on the provided network
+
+        @param network - an instance of subclass of Network. It will run the
+                         inference on the collected data.
+        @return network inference results
+        '''
+        self._running_inference = True
+        images = list(self._latest_images.values())
+        self._latest_images.clear()
+
+        result = network.infer(images)
+        self._running_inference = False
+        return result
+
+
+class Network(metaclass=abc.ABCMeta):
+    '''
+    Generic interface for a neural network to run inference. The implementers
+    are responsible for initializing the network, unpacking the incoming data
+    and potentially running the inference on multiple cores.
+    '''
+    @abc.abstractmethod
+    def infer(self, data):
+        '''
+        Unpack the given data into proper format to be fed to the network and run the inference.
+
+        @param data - some data this network can accept and run inference on
+        @returns inference result
+        '''
+
+
+def create_yolact_instance(weights_path):
+    '''
+    Creates an instance of Yolact network with the given weights
+
+    @param weights_path - path to the weights file
+    '''
+    yolact_net = Yolact()
+    yolact_net.load_weights(weights_path)
+    yolact_net.eval()
+    yolact_net = yolact_net.cuda()
+    yolact_net = CustomDataParallel(yolact_net).cuda()
+    return yolact_net
+
+
+
+
+def create_collector(collector_conf, sources, loop):
+    '''
+    Given the type of the collector create an appropriate collector instance
+
+    @param collector_type - string representing the collector to be created
+    @returns subclass of Collector
+    @raises FactoryException
+    '''
+    collector_type = collector_conf.type
+    logger.info("Creating collector: %s", collector_type)
+    if collector_type == ImageCollector.__class__.__name__:
+        return ImageCollector(sources, loop)
+    raise FactoryException("Unknown collector type: {}".format(collector_type))
+
+
+class InferenceController(object):
+    '''
+    This class is responsible for receiving images on ZMQ subscriber sockets,
+    running the inference through YOLACT and publishing the results over ZMQ.
+    '''
+    def __init__(self, config, loop):
+        '''
+        Initialize a new instance of ZmqImageReceiver
+
+        @param config - configuration of the controller
+        @param loop - instance of tornado loop
+        '''
+        self._config = config
+        self._loop = loop
+        self._zmq_topics = set()
+        self._collector = create_collector(config.collector, config.sources, loop)
+        self._network_pool = NetworkProcessPool(config.network, loop)
+        self._source_cons = []
+        self._sink_cons = []
+
+    def _handle_data(self, source, message):
+        '''
+        Collect the data from the given source
+        '''
+        self._collector.collect(source, message)
+
+        if self._collector.is_ready_to_infer:
+            results = self._collector.run_inference(self._network)
+
+    def initialize_connections(self):
+        '''
+        Create and initialize all ROS and ZMQ connections
+        '''
+        logger.info("Initializing InferenceController")
+
+        def msg_handler(source, msg):
+            '''handle incoming data'''
+            try:
+                self._loop.add_callback(self._handle_data, source, msg)
+            except Exception as error:  # pylint: disable=broad-except
+                logger.exception(error)
+
+        for source in self._config.sources:
+            callback = functools.partial(msg_handler, source)
+            zmq_sub = comm.sub_to_zmq(source, callback, self._loop)
+            self._source_cons.append(zmq_sub)
+
+        self._sink_cons = [comm.pub_to_zmq(sink) for sink in self._config.sinks]
+
+    def _route_message(self, message, topic, zmq_socket):
+        '''
+        Proxy the ros message to the provided zmq socket
+
+        @param message - instance of RosImage
+        @param topic - ros topic string
+        @param zmq_socket - instance of zmq pub socket
+        '''
+        image = None
+        width, height, depth = image.shape
+        seq_num = self._ros_con_seq[topic]
+
+        proto = Image(timestamp_sec=self._loop.time(),
+                      sequence_num=seq_num,
+                      width=width,
+                      height=height,
+                      depth=depth,
+                      image_data=image.tobytes(),
+                      dtype=str(image.dtype))
+
+        zmq_socket.send(proto.SerializeToString())
+        self._ros_con_seq[topic] += 1
+
+    def shutdown(self):
+        '''
+        Shutdown this proxy
+        '''
+        logger.info("Calling shutdown")
+        for ros_con in self._ros_cons:
+            logger.info("Closing ros topic: %s", ros_con.name)
+            ros_con.unregister()
+
+        for ros_topic, zmq_con in self._ros_zmq_conns.items():
+            logger.info("Closing zmq connection for ROS topic: %s", ros_topic)
+            zmq_con.close()
+
+
+DESCRIPTION = '''
+Inferencer receives the images through ZMQ and runs Yolact inference. The
+results get published back to beyond.
+'''
+
+
+def interrupt_handler(signal_id, _, loop, control):
+    '''
+    Handles the SIGINT interrupt
+
+    @param loop - tornado ioloop
+    @param signal_id - signal id that caused this interrupt(SIGINT)
+    @param _ - current stack frame
+    @param control - InferenceController instance
+    '''
+    try:
+        logger.info("Received signal 'SIGINT:%s', shutting down...", signal_id)
+        loop.add_callback_from_signal(control.shutdown)
+        loop.add_callback_from_signal(loop.stop)
+    except Exception as error:  # pylint: disable=broad-except
+        traceback.print_exc()
+        sys.exit(1)
+
+
+async def executor_test(loop):
+    sleep_time = np.random.randint(5)
+
+    def sleep_some(sleep_time):
+        print("going to sleep for {} seconds".format(sleep_time))
+        time.sleep(sleep_time)
+        print("ooah, awake after {} seconds".format(sleep_time))
+
+    future = loop.run_in_executor(None, sleep_some, sleep_time)
+    await future
+
+
+def main():
+    '''main, whatcha want?'''
+    parser = argparse.ArgumentParser(description=DESCRIPTION)
+    parser.add_argument("-c",
+                        "--config",
+                        help="Config file containing the pipeline settings",
+                        type=argparse.FileType("r"),
+                        required=True)
+
+    parser.add_argument("-l",
+                        "--log",
+                        help="Log file path",
+                        default="inferencer.log",
+                        type=str)
+
+    args = parser.parse_args()
+
+    if args.log is not None:
+        logzero.logfile(args.log, maxBytes=1e7)
+        logzero.loglevel(logging.INFO)
+
+    config = bunch.fromYAML(args.config)
+
+    loop = ioloop.IOLoop.instance()
+    control = InferenceController(config, loop)
+    interrupt_partial = functools.partial(interrupt_handler, loop=loop, control=control)
+
+    signal.signal(signal.SIGINT, interrupt_partial)
+    signal.signal(signal.SIGTERM, interrupt_partial)
+
+    with torch.no_grad():
+        @wraploop.eventloop
+        @gen.coroutine
+        def run_proxy(_):
+            '''
+            Run the server
+            '''
+            logger.info("Started ZMQ Inferencer")
+            control.initialize_connections()
+            callback = functools.partial(executor_test, loop)
+            period_cb = ioloop.PeriodicCallback(callback, 100)
+            period_cb.start()
+            return 0
+
+        ret_code = run_proxy(loop)
+        sys.exit(ret_code)
+
+
+if __name__ == "__main__":
+    main()

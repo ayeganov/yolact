@@ -1,0 +1,20 @@
+syntax= "proto2";
+
+message Image {
+  optional double timestamp_sec = 1; // timestamp when this image was created
+  optional uint64 sequence_num = 2; // sequence number of this image
+  optional int32  width = 3; // Width of this image
+  optional int32  height = 4; // Height of this image
+  optional int32 depth = 5; // Depth of this image
+  optional string format = 6; // Format of the image: rgb, bgr, grb etc...
+  optional bytes image_data = 7; // Actual image data following the format specified above
+  optional string dtype = 8; // Data type of the bytes in the image data. Corresponds to numpy dtype types.
+  optional string source = 9; // Name of the topic/camera/other that generated this image
+}
+
+
+message Detection {
+  optional double timestamp_sec = 1; // timestamp when this image was created
+  optional uint64 sequence_num = 2; // sequence number of this image
+
+}

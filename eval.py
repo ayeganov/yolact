@@ -669,6 +669,7 @@ def badhash(x):
     x =  ((x >> 16) ^ x) & 0xFFFFFFFF
     return x
 
+
 def evalimage(net:Yolact, path:str, save_path:str=None):
     frame = torch.from_numpy(cv2.imread(path)).cuda().float()
     batch = FastBaseTransform()(frame.unsqueeze(0))
@@ -685,6 +686,7 @@ def evalimage(net:Yolact, path:str, save_path:str=None):
         plt.show()
     else:
         cv2.imwrite(save_path, img_numpy)
+
 
 def eval_torch(net, images, H, W, frame_id, cam_name=None):
     """
@@ -712,12 +714,13 @@ def eval_torch(net, images, H, W, frame_id, cam_name=None):
     """
     preds = net(images)
     if cam_name is None:
-       cam_name='images {}'.format(args.port)
+        cam_name = 'images {}'.format(args.port)
     final = preds2final(preds, frame_id, H, W, cam_name)
 
     if args.to_publish:
         publish_final(final)
     return final
+
 
 def preds2final(preds, frame_id, H, W, sensor_id=None):
     """
@@ -752,7 +755,7 @@ def preds2final(preds, frame_id, H, W, sensor_id=None):
         masks = masks[keep]
         proto = p['proto']
         masks = torch.matmul(proto, masks.t())
-        masks = cfg.mask_proto_mask_activation(masks)
+        masks = torch.sigmoid(masks)
         masks = crop(masks, boxes)
         masks = masks.permute(2, 0, 1).contiguous()
         masks = F.interpolate(masks.unsqueeze(0), (H, W), mode='bilinear', align_corners=False).squeeze(0)
@@ -776,6 +779,7 @@ def preds2final(preds, frame_id, H, W, sensor_id=None):
         # And append
         final['detections'].append(cur_image)
     return final
+
 
 def evalimages(net:Yolact, input_folder:str, output_folder:str):
     if output_folder and not os.path.exists(output_folder):
@@ -804,11 +808,13 @@ def evalimages(net:Yolact, input_folder:str, output_folder:str):
 from multiprocessing.pool import ThreadPool
 from queue import Queue
 
+
 class CustomDataParallel(torch.nn.DataParallel):
     """ A Custom Data Parallel class that properly gathers lists of dictionaries. """
     def gather(self, outputs, output_device):
         # Note that I don't actually want to convert everything to the output_device
         return sum(outputs, [])
+
 
 def evalframes(net:Yolact, imgfolder:str, out_path:str=None):
     """
@@ -1483,6 +1489,7 @@ def print_maps(all_maps):
     print(make_sep(len(all_maps['box']) + 1))
     print()
 
+
 if __name__ == '__main__':
     parse_args()
 
@@ -1533,7 +1540,7 @@ if __name__ == '__main__':
                                     transform=BaseTransform(), has_gt=cfg.dataset.has_gt)
             prep_coco_cats()
         else:
-            dataset = None        
+            dataset = None
 
         print('Loading model...', end='')
         net = Yolact()

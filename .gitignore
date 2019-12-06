@@ -162,3 +162,10 @@ _.py
 *.swp
 *.png
 *results.txt
+
+# vim stuff
+*.un~
+*.swp
+
+# python stuff
+*.py[cod]
