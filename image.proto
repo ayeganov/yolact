@@ -13,8 +13,31 @@ message Image {
 }
 
 
-message Detection {
-  optional double timestamp_sec = 1; // timestamp when this image was created
-  optional uint64 sequence_num = 2; // sequence number of this image
+message Box {
+  optional int32 x_left = 1;
+  optional int32 y_top = 2;
+  optional int32 x_right = 3;
+  optional int32 y_bottom = 4;
+}
 
+
+message Detection {
+  optional double timestamp_sec = 1; // Timestamp when this image was created
+  optional uint64 sequence_num = 2; // Sequence number of the image this detection came from
+  optional string source = 3; // Name of the topic/camera/other that generated this images detection
+  optional int32  width = 4; // Width of the mask
+  optional int32  height = 5; // Height of the mask
+  optional int32 depth = 6; // Depth of the mask, null if mask is 2D
+  optional bytes mask = 7; // Mask image data
+  optional string dtype = 8; // Data type of the bytes in the data. Corresponds to numpy dtype types.
+  optional Box box = 9; // detection box around the object within the mask
+  optional double score = 10;  // score of this particular class
+  optional int32 klass = 11;  // classification, or category of this particular detection
+  optional float inference_time = 12;  // total time it took to process the image this detection came from
+}
+
+
+message NetOutput {
+  optional string net_name = 1;  // name of the neural network
+  repeated bytes output = 2;     // list of network outputs
 }

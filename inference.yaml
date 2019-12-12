@@ -1,20 +1,20 @@
 ---
 sources:
   - tcp://127.0.0.1:9030
+    #  - tcp://127.0.0.1:9031
 
 sinks:
   - tcp://127.0.0.1:1030
 
 network:
-  - type: Yolact
-  - num_procs: 3
-  - weights_path: ./weights/yolact_resnet50_54_800000.pth
-  - score_threshold: 0.8
-  - input_type: Image
-  - output_type: DetectionBox
-  - input_size: 1920x1080x3
-  - dtype: uint8
-  - fudge: 100  # Number of extra bytes to use when allocating shared memory
+  type: Yolact
+  num_procs: 2
+  weights_path: weights/yolact_resnet50_54_800000.pth
+  score_threshold: 0.8
+  input_size: 1920x1080x3
+  dtype: uint8
+  batch_size: 1
+  fudge: 100  # Number of extra bytes to use when allocating shared memory
 
 collector:
-  - type: ImageCollector
+  type: BatchCollector

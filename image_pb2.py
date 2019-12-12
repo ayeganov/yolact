@@ -19,7 +19,7 @@ DESCRIPTOR = _descriptor.FileDescriptor(
   name='image.proto',
   package='',
   syntax='proto2',
-  serialized_pb=_b('\n\x0bimage.proto\"\x95\x01\n\x05Image\x12\x15\n\rtimestamp_sec\x18\x01 \x01(\x01\x12\x14\n\x0csequence_num\x18\x02 \x01(\x04\x12\r\n\x05width\x18\x03 \x01(\x05\x12\x0e\n\x06height\x18\x04 \x01(\x05\x12\r\n\x05\x64\x65pth\x18\x05 \x01(\x05\x12\x0e\n\x06\x66ormat\x18\x06 \x01(\t\x12\x12\n\nimage_data\x18\x07 \x01(\x0c\x12\r\n\x05\x64type\x18\x08 \x01(\t')
+  serialized_pb=_b('\n\x0bimage.proto\"\xa5\x01\n\x05Image\x12\x15\n\rtimestamp_sec\x18\x01 \x01(\x01\x12\x14\n\x0csequence_num\x18\x02 \x01(\x04\x12\r\n\x05width\x18\x03 \x01(\x05\x12\x0e\n\x06height\x18\x04 \x01(\x05\x12\r\n\x05\x64\x65pth\x18\x05 \x01(\x05\x12\x0e\n\x06\x66ormat\x18\x06 \x01(\t\x12\x12\n\nimage_data\x18\x07 \x01(\x0c\x12\r\n\x05\x64type\x18\x08 \x01(\t\x12\x0e\n\x06source\x18\t \x01(\t\"G\n\x03\x42ox\x12\x0e\n\x06x_left\x18\x01 \x01(\x05\x12\r\n\x05y_top\x18\x02 \x01(\x05\x12\x0f\n\x07x_right\x18\x03 \x01(\x05\x12\x10\n\x08y_bottom\x18\x04 \x01(\x05\"\xdc\x01\n\tDetection\x12\x15\n\rtimestamp_sec\x18\x01 \x01(\x01\x12\x14\n\x0csequence_num\x18\x02 \x01(\x04\x12\x0e\n\x06source\x18\x03 \x01(\t\x12\r\n\x05width\x18\x04 \x01(\x05\x12\x0e\n\x06height\x18\x05 \x01(\x05\x12\r\n\x05\x64\x65pth\x18\x06 \x01(\x05\x12\x0c\n\x04mask\x18\x07 \x01(\x0c\x12\r\n\x05\x64type\x18\x08 \x01(\t\x12\x11\n\x03\x62ox\x18\t \x01(\x0b\x32\x04.Box\x12\r\n\x05score\x18\n \x01(\x01\x12\r\n\x05klass\x18\x0b \x01(\x05\x12\x16\n\x0einference_time\x18\x0c \x01(\x02\"\x1b\n\tNetOutput\x12\x0e\n\x06output\x18\x01 \x03(\x0c')
 )
 
 
@@ -88,6 +88,13 @@ _IMAGE = _descriptor.Descriptor(
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='source', full_name='Image.source', index=8,
+      number=9, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=_b("").decode('utf-8'),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      options=None, file=DESCRIPTOR),
   ],
   extensions=[
   ],
@@ -101,10 +108,205 @@ _IMAGE = _descriptor.Descriptor(
   oneofs=[
   ],
   serialized_start=16,
-  serialized_end=165,
+  serialized_end=181,
 )
 
+
+_BOX = _descriptor.Descriptor(
+  name='Box',
+  full_name='Box',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  fields=[
+    _descriptor.FieldDescriptor(
+      name='x_left', full_name='Box.x_left', index=0,
+      number=1, type=5, cpp_type=1, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='y_top', full_name='Box.y_top', index=1,
+      number=2, type=5, cpp_type=1, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='x_right', full_name='Box.x_right', index=2,
+      number=3, type=5, cpp_type=1, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='y_bottom', full_name='Box.y_bottom', index=3,
+      number=4, type=5, cpp_type=1, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      options=None, file=DESCRIPTOR),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  options=None,
+  is_extendable=False,
+  syntax='proto2',
+  extension_ranges=[],
+  oneofs=[
+  ],
+  serialized_start=183,
+  serialized_end=254,
+)
+
+
+_DETECTION = _descriptor.Descriptor(
+  name='Detection',
+  full_name='Detection',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  fields=[
+    _descriptor.FieldDescriptor(
+      name='timestamp_sec', full_name='Detection.timestamp_sec', index=0,
+      number=1, type=1, cpp_type=5, label=1,
+      has_default_value=False, default_value=float(0),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='sequence_num', full_name='Detection.sequence_num', index=1,
+      number=2, type=4, cpp_type=4, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='source', full_name='Detection.source', index=2,
+      number=3, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=_b("").decode('utf-8'),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='width', full_name='Detection.width', index=3,
+      number=4, type=5, cpp_type=1, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='height', full_name='Detection.height', index=4,
+      number=5, type=5, cpp_type=1, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='depth', full_name='Detection.depth', index=5,
+      number=6, type=5, cpp_type=1, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='mask', full_name='Detection.mask', index=6,
+      number=7, type=12, cpp_type=9, label=1,
+      has_default_value=False, default_value=_b(""),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='dtype', full_name='Detection.dtype', index=7,
+      number=8, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=_b("").decode('utf-8'),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='box', full_name='Detection.box', index=8,
+      number=9, type=11, cpp_type=10, label=1,
+      has_default_value=False, default_value=None,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='score', full_name='Detection.score', index=9,
+      number=10, type=1, cpp_type=5, label=1,
+      has_default_value=False, default_value=float(0),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='klass', full_name='Detection.klass', index=10,
+      number=11, type=5, cpp_type=1, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      options=None, file=DESCRIPTOR),
+    _descriptor.FieldDescriptor(
+      name='inference_time', full_name='Detection.inference_time', index=11,
+      number=12, type=2, cpp_type=6, label=1,
+      has_default_value=False, default_value=float(0),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      options=None, file=DESCRIPTOR),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  options=None,
+  is_extendable=False,
+  syntax='proto2',
+  extension_ranges=[],
+  oneofs=[
+  ],
+  serialized_start=257,
+  serialized_end=477,
+)
+
+
+_NETOUTPUT = _descriptor.Descriptor(
+  name='NetOutput',
+  full_name='NetOutput',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  fields=[
+    _descriptor.FieldDescriptor(
+      name='output', full_name='NetOutput.output', index=0,
+      number=1, type=12, cpp_type=9, label=3,
+      has_default_value=False, default_value=[],
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      options=None, file=DESCRIPTOR),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  options=None,
+  is_extendable=False,
+  syntax='proto2',
+  extension_ranges=[],
+  oneofs=[
+  ],
+  serialized_start=479,
+  serialized_end=506,
+)
+
+_DETECTION.fields_by_name['box'].message_type = _BOX
 DESCRIPTOR.message_types_by_name['Image'] = _IMAGE
+DESCRIPTOR.message_types_by_name['Box'] = _BOX
+DESCRIPTOR.message_types_by_name['Detection'] = _DETECTION
+DESCRIPTOR.message_types_by_name['NetOutput'] = _NETOUTPUT
 _sym_db.RegisterFileDescriptor(DESCRIPTOR)
 
 Image = _reflection.GeneratedProtocolMessageType('Image', (_message.Message,), dict(
@@ -113,6 +315,27 @@ Image = _reflection.GeneratedProtocolMessageType('Image', (_message.Message,), d
   # @@protoc_insertion_point(class_scope:Image)
   ))
 _sym_db.RegisterMessage(Image)
+
+Box = _reflection.GeneratedProtocolMessageType('Box', (_message.Message,), dict(
+  DESCRIPTOR = _BOX,
+  __module__ = 'image_pb2'
+  # @@protoc_insertion_point(class_scope:Box)
+  ))
+_sym_db.RegisterMessage(Box)
+
+Detection = _reflection.GeneratedProtocolMessageType('Detection', (_message.Message,), dict(
+  DESCRIPTOR = _DETECTION,
+  __module__ = 'image_pb2'
+  # @@protoc_insertion_point(class_scope:Detection)
+  ))
+_sym_db.RegisterMessage(Detection)
+
+NetOutput = _reflection.GeneratedProtocolMessageType('NetOutput', (_message.Message,), dict(
+  DESCRIPTOR = _NETOUTPUT,
+  __module__ = 'image_pb2'
+  # @@protoc_insertion_point(class_scope:NetOutput)
+  ))
+_sym_db.RegisterMessage(NetOutput)
 
 
 # @@protoc_insertion_point(module_scope)

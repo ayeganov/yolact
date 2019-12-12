@@ -14,15 +14,26 @@ import traceback
 
 from logzero import logger
 from tornado import ioloop, gen
-import bunch
+import cv2
+import munch
 import logzero
 import numpy as np
 import torch
 
-from eval import CustomDataParallel
+from image_pb2 import Detection, NetOutput
 from netpool import NetworkProcessPool
 import comm
 import wraploop
+
+
+LOG_LEVELS = {
+    "warn": logging.WARNING,
+    "error": logging.ERROR,
+    "info": logging.INFO,
+    "debug": logging.DEBUG,
+    "critical": logging.CRITICAL,
+    "fatal": logging.FATAL
+}
 
 
 class FactoryException(Exception):
@@ -67,20 +78,20 @@ class Collector(metaclass=abc.ABCMeta):
         '''
 
 
-class ImageCollector(Collector):
+class BatchCollector(Collector):
     '''
-    Collect images coming from the receiver, concatenate them and run through the network inference
+    Collect data coming from the receiver, concatenate them and run through the network inference
     '''
     def __init__(self, sources, loop):
         '''
         Initialize a new instance of the Collector
 
-        @param sources - a set containing unique strings representing image sources
+        @param sources - a set containing unique strings representing data sources
         @param loop - instance IOLoop
         '''
         self._sources = sources
         self._loop = loop
-        self._latest_images = {}
+        self._latest_data = {}
         self._future_inference = None
         self._running_inference = False
 
@@ -90,16 +101,16 @@ class ImageCollector(Collector):
         Check if all images have been received, and can be run through the inference.
         True if images ready and inference is not being run right now, False otherwise.
         '''
-        all_sources_provided_data = all(s in self._latest_images for s in self._sources)
+        all_sources_provided_data = all(s in self._latest_data for s in self._sources)
         return not self._running_inference and all_sources_provided_data
 
-    def collect(self, source, image):
+    def collect(self, source, datum):  # pylint: disable=arguments-differ
         '''
-        Collect the image from the provided source
+        Collect the datum from the provided source
         '''
-        self._latest_images[source] = image
+        self._latest_data[source] = datum
 
-    def run_inference(self, network):
+    async def run_inference(self, network):
         '''
         Execute the inference on the provided network
 
@@ -108,44 +119,12 @@ class ImageCollector(Collector):
         @return network inference results
         '''
         self._running_inference = True
-        images = list(self._latest_images.values())
-        self._latest_images.clear()
+        images = list(self._latest_data.values())
+        self._latest_data.clear()
 
-        result = network.infer(images)
+        result = await network.submit(images)
         self._running_inference = False
         return result
-
-
-class Network(metaclass=abc.ABCMeta):
-    '''
-    Generic interface for a neural network to run inference. The implementers
-    are responsible for initializing the network, unpacking the incoming data
-    and potentially running the inference on multiple cores.
-    '''
-    @abc.abstractmethod
-    def infer(self, data):
-        '''
-        Unpack the given data into proper format to be fed to the network and run the inference.
-
-        @param data - some data this network can accept and run inference on
-        @returns inference result
-        '''
-
-
-def create_yolact_instance(weights_path):
-    '''
-    Creates an instance of Yolact network with the given weights
-
-    @param weights_path - path to the weights file
-    '''
-    yolact_net = Yolact()
-    yolact_net.load_weights(weights_path)
-    yolact_net.eval()
-    yolact_net = yolact_net.cuda()
-    yolact_net = CustomDataParallel(yolact_net).cuda()
-    return yolact_net
-
-
 
 
 def create_collector(collector_conf, sources, loop):
@@ -158,9 +137,22 @@ def create_collector(collector_conf, sources, loop):
     '''
     collector_type = collector_conf.type
     logger.info("Creating collector: %s", collector_type)
-    if collector_type == ImageCollector.__class__.__name__:
-        return ImageCollector(sources, loop)
+    if collector_type == BatchCollector.__name__:
+        return BatchCollector(sources, loop)
     raise FactoryException("Unknown collector type: {}".format(collector_type))
+
+
+def display_result(net_output):
+    output = NetOutput()
+    output .ParseFromString(net_output)
+
+    proto = Detection()
+    proto.ParseFromString(output.output[0])
+    mask_img = np.frombuffer(proto.mask, dtype=np.dtype("uint8")).reshape(proto.width, proto.height)
+    logger.debug("Got result %s", proto.sequence_num)
+
+    cv2.imshow("Net Pool", mask_img)
+    cv2.waitKey(1)
 
 
 class InferenceController(object):
@@ -179,18 +171,34 @@ class InferenceController(object):
         self._loop = loop
         self._zmq_topics = set()
         self._collector = create_collector(config.collector, config.sources, loop)
-        self._network_pool = NetworkProcessPool(config.network, loop)
+        self._network_pool = NetworkProcessPool(config.network, queue_size=9, loop=loop)
         self._source_cons = []
         self._sink_cons = []
 
-    def _handle_data(self, source, message):
+    async def _handle_data(self, source, message):
         '''
         Collect the data from the given source
         '''
         self._collector.collect(source, message)
 
-        if self._collector.is_ready_to_infer:
-            results = self._collector.run_inference(self._network)
+        if self._collector.is_ready_to_infer and self._network_pool.is_ready:
+            net_output = await self._collector.run_inference(self._network_pool)
+
+            # TODO: Remove next line, it is there only for demonstration purpose only
+            self._loop.add_callback(display_result, net_output)
+            await self._loop.run_in_executor(None, self._sink_output, net_output)
+        else:
+            logger.warn("Dropping messages because collector or network is not ready")
+
+    def _sink_output(self, net_output):
+        '''
+        Send the output to all of the configured sink sockets
+
+        @param net_output - serialized output of the network
+        '''
+        logger.debug("Sending the data back to beyond")
+        for zmq_sock in self._sink_cons:
+            zmq_sock.send(net_output)
 
     def initialize_connections(self):
         '''
@@ -201,7 +209,7 @@ class InferenceController(object):
         def msg_handler(source, msg):
             '''handle incoming data'''
             try:
-                self._loop.add_callback(self._handle_data, source, msg)
+                self._loop.add_callback(self._handle_data, source, msg[0])
             except Exception as error:  # pylint: disable=broad-except
                 logger.exception(error)
 
@@ -212,46 +220,24 @@ class InferenceController(object):
 
         self._sink_cons = [comm.pub_to_zmq(sink) for sink in self._config.sinks]
 
-    def _route_message(self, message, topic, zmq_socket):
-        '''
-        Proxy the ros message to the provided zmq socket
-
-        @param message - instance of RosImage
-        @param topic - ros topic string
-        @param zmq_socket - instance of zmq pub socket
-        '''
-        image = None
-        width, height, depth = image.shape
-        seq_num = self._ros_con_seq[topic]
-
-        proto = Image(timestamp_sec=self._loop.time(),
-                      sequence_num=seq_num,
-                      width=width,
-                      height=height,
-                      depth=depth,
-                      image_data=image.tobytes(),
-                      dtype=str(image.dtype))
-
-        zmq_socket.send(proto.SerializeToString())
-        self._ros_con_seq[topic] += 1
-
     def shutdown(self):
         '''
         Shutdown this proxy
         '''
         logger.info("Calling shutdown")
-        for ros_con in self._ros_cons:
-            logger.info("Closing ros topic: %s", ros_con.name)
-            ros_con.unregister()
+        self._network_pool.shutdown()
+        for zmq_con in self._source_cons:
+            logger.info("Closing zmq connection from beyond")
+            zmq_con.close()
 
-        for ros_topic, zmq_con in self._ros_zmq_conns.items():
-            logger.info("Closing zmq connection for ROS topic: %s", ros_topic)
+        for zmq_con in self._sink_cons:
+            logger.info("Closing zmq connection to beyond")
             zmq_con.close()
 
 
 DESCRIPTION = '''
-Inferencer receives the images through ZMQ and runs Yolact inference. The
-results get published back to beyond.
+Inferencer receives the network input data through ZMQ and runs configured
+network. The results get published back to beyond through the sink.
 '''
 
 
@@ -269,20 +255,23 @@ def interrupt_handler(signal_id, _, loop, control):
         loop.add_callback_from_signal(control.shutdown)
         loop.add_callback_from_signal(loop.stop)
     except Exception as error:  # pylint: disable=broad-except
-        traceback.print_exc()
+        logger.exception(error)
         sys.exit(1)
 
 
-async def executor_test(loop):
-    sleep_time = np.random.randint(5)
+async def executor_test(loop, netpool):
+#    sleep_time = np.random.randint(5)
 
     def sleep_some(sleep_time):
         print("going to sleep for {} seconds".format(sleep_time))
         time.sleep(sleep_time)
         print("ooah, awake after {} seconds".format(sleep_time))
 
-    future = loop.run_in_executor(None, sleep_some, sleep_time)
-    await future
+    logger.info("Submitting work")
+    data = [bytes([c]) for c in range(3)]
+#    future = loop.run_in_executor(None, sleep_some, sleep_time)
+    await netpool.submit(data)
+#    await future
 
 
 def main():
@@ -299,14 +288,18 @@ def main():
                         help="Log file path",
                         default="inferencer.log",
                         type=str)
+    parser.add_argument("-v",
+                        "--level",
+                        default="info",
+                        choices=["info", "warn", "fatal", "error", "critical", "debug"])
 
     args = parser.parse_args()
 
     if args.log is not None:
         logzero.logfile(args.log, maxBytes=1e7)
-        logzero.loglevel(logging.INFO)
+        logzero.loglevel(LOG_LEVELS[args.level])
 
-    config = bunch.fromYAML(args.config)
+    config = munch.Munch.fromYAML(args.config)
 
     loop = ioloop.IOLoop.instance()
     control = InferenceController(config, loop)
@@ -315,22 +308,19 @@ def main():
     signal.signal(signal.SIGINT, interrupt_partial)
     signal.signal(signal.SIGTERM, interrupt_partial)
 
-    with torch.no_grad():
-        @wraploop.eventloop
-        @gen.coroutine
-        def run_proxy(_):
-            '''
-            Run the server
-            '''
-            logger.info("Started ZMQ Inferencer")
-            control.initialize_connections()
-            callback = functools.partial(executor_test, loop)
-            period_cb = ioloop.PeriodicCallback(callback, 100)
-            period_cb.start()
-            return 0
+    @wraploop.eventloop
+    @gen.coroutine
+    def run_proxy(_):
+        '''
+        Run the server
+        '''
+        logger.info("Started ZMQ Inferencer")
+        control.initialize_connections()
 
-        ret_code = run_proxy(loop)
-        sys.exit(ret_code)
+        return 0
+
+    ret_code = run_proxy(loop)
+    sys.exit(ret_code)
 
 
 if __name__ == "__main__":
