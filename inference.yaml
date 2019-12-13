@@ -1,7 +1,11 @@
 ---
 sources:
   - tcp://127.0.0.1:9030
-    #  - tcp://127.0.0.1:9031
+  - tcp://127.0.0.1:9031
+  - tcp://127.0.0.1:9030
+  - tcp://127.0.0.1:9031
+  - tcp://127.0.0.1:9030
+  - tcp://127.0.0.1:9031
 
 sinks:
   - tcp://127.0.0.1:1030
@@ -13,7 +17,7 @@ network:
   score_threshold: 0.8
   input_size: 1920x1080x3
   dtype: uint8
-  batch_size: 1
+  batch_size: 2
   fudge: 100  # Number of extra bytes to use when allocating shared memory
 
 collector:

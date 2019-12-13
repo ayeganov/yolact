@@ -4,6 +4,7 @@ for inference
 '''
 from collections import namedtuple
 from multiprocessing.sharedctypes import RawArray
+from itertools import islice
 import abc
 import enum
 import functools
@@ -40,6 +41,22 @@ try:
     set_start_method("spawn")
 except RuntimeError:
     pass
+
+
+MAX_BATCH_SIZE = 8
+
+
+def batchify(sequence, size=2):
+    """
+    Breaks a sequence into a set of batches of given size.
+
+    @param sequence - an iterable sequence: list, generator
+    """
+    it = iter(sequence)
+    batch = tuple(islice(it, size))
+    while batch:
+        yield batch
+        batch = tuple(islice(it, size))
 
 
 class NetworkType(enum.Enum):
@@ -257,6 +274,19 @@ class NetworkProcess(Process, metaclass=abc.ABCMeta):
 
         self._respond_to_pool(Response.Done)
 
+    def _read_input_payload(self, msg_lengths):
+        '''
+        Given the lengths of each individual message read off all of them from the shared array.
+        '''
+        start = 0
+        input_array = np.ctypeslib.as_array(self._input_output.input)
+        payloads = []
+        for msg_length in msg_lengths:
+            end = start + msg_length
+            payloads.append(input_array[start:end].tobytes())
+            start = end
+        return payloads
+
     async def _execute_command(self, cmd_msg):
         '''
         Execute the parsed command coming from the process pool
@@ -274,17 +304,18 @@ class NetworkProcess(Process, metaclass=abc.ABCMeta):
         elif command == Command.DoWork:
             try:
                 logger.debug("%s got payload", self.name)
-                input_array = np.ctypeslib.as_array(self._input_output.input)
-                payload = input_array[:cmd_msg.msg_length].tobytes()
+                payloads = self._read_input_payload(cmd_msg.msg_lengths)
 
-                net_input = self._parse_payload(payload)
+                net_input = self._parse_payload(payloads)
+                sources = [ni.source for ni in net_input]
+                seq_nums = [ni.sequence_num for ni in net_input]
                 net_output, height, depth, width, inference_time = self._execute_network(net_input)
                 serialized_output = self._serialize_output(net_output,
                                                            height,
                                                            width,
                                                            depth,
-                                                           net_input.source,
-                                                           net_input.sequence_num,
+                                                           sources,
+                                                           seq_nums,
                                                            inference_time)
 
                 await self._transfer_output_to_pool(serialized_output)
@@ -362,28 +393,33 @@ class YolactNetwork(NetworkProcess):
         self._net = create_yolact_instance(weights_path)
         self._transform = torch.nn.DataParallel(FastBaseTransform()).cuda()
 
-    def _parse_payload(self, payload):
+    def _parse_payload(self, payloads):  # pylint: disable=arguments-differ
         '''
-        Parse the serialized message representing an image
+        Parse the serialized messages representing images
 
-        @param payload - bytes of the protobuf message
-        @return serialized Image protobuf message
+        @param payloads - a list of bytes of the protobuf messages
+        @return serialized list of Image protobuf messages
         '''
-        return to_image(payload)
+        return [to_image(payload) for payload in payloads]
 
-    def _preprocess_input(self, image):
+    def _preprocess_input(self, images):
         '''
-        Convert the image to cuda torch tensor to run through the network
+        Convert the images to cuda torch tensor to run through the network
 
-        @param image - instance of Image protobuf
+        @param images - a list of instances of Image protobuf
         @returns torch tensor
         '''
 #        logger.info("image: %s", image.sequence_num)
-        numpy_image = image_to_numpy(image)
+        images = [image_to_numpy(image) for image in images]
+        for image in images:
+            logger.debug("numpy images shape: %s", image.shape)
 
-        net_ready_img = torch.from_numpy(numpy_image).cuda().float()
-        net_ready_img = self._transform(torch.stack((net_ready_img,), 0))
-        return net_ready_img
+        numpy_images = [torch.from_numpy(image).cuda().float() for image in images]
+        height, width, _ = numpy_images[0].shape
+
+        logger.debug("net ready images shape: %s", numpy_images[0].shape)
+        net_ready_imgs = self._transform(torch.stack(numpy_images, 0))
+        return net_ready_imgs, height, width
 
     def _seraialize_to_detection(self, mask, box, score, klass, source, sequence_num, inference_time):
         '''
@@ -423,8 +459,8 @@ class YolactNetwork(NetworkProcess):
                           height,
                           width,
                           depth,
-                          source,
-                          sequence_num,
+                          sources,
+                          sequence_nums,
                           inference_time):
         '''
         Serialize network output to detection boxes
@@ -433,18 +469,20 @@ class YolactNetwork(NetworkProcess):
         @param height - height of the input image
         @param width - width of the input image
         @param depth - depth of the input image
-        @param source - string representation of the image origin
-        @param sequence_num - sequence number of the image
+        @param sources - string representation of the images origins
+        @param sequence_nums - sequence numbers of the input images
         @param inference_time - duration of the inference calculation
         @returns a list of DetectionBox instances
         '''
         detections = []
         start = time.perf_counter()
-        for pred in predictions:
+        for pred, source, sequence_num in zip(predictions, sources, sequence_nums):
             # Scores
             scores = pred['score']
             keep = scores > self._score_threshold
             scores = scores[keep]
+            if len(scores) < 1:
+                continue
 
             # Categories
             classes = pred['class'][keep]
@@ -479,21 +517,20 @@ class YolactNetwork(NetworkProcess):
 
         return detections
 
-    def _execute_network(self, image):  # pylint: disable=arguments-differ
+    def _execute_network(self, images):  # pylint: disable=arguments-differ
         '''
         Executes the network with the provided image
 
-        @param image - image sent to this network for processing
+        @param images - images sent to this network for processing
         @returns network output, input height, depth, width and inference time
         '''
         inference_start = time.perf_counter()
-        net_ready_img = self._preprocess_input(image)
-        depth, height, width = net_ready_img[0].shape
+        net_ready_img, height, width = self._preprocess_input(images)
 
         predictions = self._net(net_ready_img)
         inference_time = time.perf_counter() - inference_start
         logger.debug("Inference time: %s", inference_time)
-        return predictions, height, depth, width, inference_time
+        return predictions, height, None, width, inference_time
 
 
 class ProcessPool(metaclass=abc.ABCMeta):
@@ -596,6 +633,7 @@ class NetworkProcessPool(ProcessPool):
         '''
         self._network_conf = network_conf
         self._num_procs = network_conf.num_procs
+        self._batch_size = network_conf.batch_size
         self._queue_size = queue_size
         self._loop = loop
         self._dtype = np.dtype(network_conf.dtype)
@@ -603,6 +641,9 @@ class NetworkProcessPool(ProcessPool):
         max_procs = get_max_proc_children()
         if not 1 <= self._num_procs <= max_procs:
             raise InvalidConfigError("Num of procs must be a positive int between 1 and {}.".format(max_procs))
+
+        if not 1 <= self._batch_size <= MAX_BATCH_SIZE:
+            raise InvalidConfigError("Batch size must be a positive int between 1 and {}.".format(MAX_BATCH_SIZE))
 
         self._procs = []
         self._zmq_socks = []
@@ -692,6 +733,9 @@ class NetworkProcessPool(ProcessPool):
         input_size = get_input_byte_size(input_size, self._dtype) + self._network_conf.fudge
         output_size = input_size
 
+        # scale input by the batch size
+        input_size *= self._batch_size
+
         ctype = np.ctypeslib.as_ctypes_type(self._dtype)
         input_array = RawArray(ctype, input_size)
         output_array = RawArray(ctype, output_size)
@@ -754,21 +798,35 @@ class NetworkProcessPool(ProcessPool):
         zmq_sock = self._zmq_socks[proc_idx]
         zmq_sock.send_json(command)
 
+    def _transfer_to_network_proces(self, proc_idx, batch):
+        '''
+        Write out the batch of data to the networks process shared memory
+
+        @param proc_idx - index of the target process
+        @param batch - batch of the input data
+        '''
+        input_array = np.ctypeslib.as_array(self._input_output[proc_idx].input)
+        start = 0
+
+        for item in batch:
+            end = start + len(item)
+            input_array[start:end] = np.frombuffer(item, self._dtype)
+            start = end
+
     def _start_work(self, proc_idx, work):
         '''
         Push new work item to the process specified by its index.
 
         @param proc_idx - index of the process to do the work
-        @param work - some data to be processed by the NN
+        @param work - tuple batch of data to be processed by the NN
         '''
-        msg_length = len(work)
+        msg_lengths = [len(w) for w in work]
 
-        input_array = np.ctypeslib.as_array(self._input_output[proc_idx].input)
-        input_array[:msg_length] = np.frombuffer(work, self._dtype)
+        self._transfer_to_network_proces(proc_idx, work)
 
         self._set_proc_state(proc_idx, ProcessState.Busy)
         self._proc_futures[proc_idx].append(Future())
-        self._send_command(proc_idx, Command.DoWork, msg_length=msg_length)
+        self._send_command(proc_idx, Command.DoWork, msg_lengths=msg_lengths)
 
     @property
     def is_ready(self):
@@ -822,12 +880,12 @@ class NetworkProcessPool(ProcessPool):
         self._reset_futures()
         self._proc_results = []
 
-        for datum in data:
+        for batch in batchify(data, self._batch_size):
             proc_idx = self._available_idx()
             if proc_idx is not None:
-                self._start_work(proc_idx, datum)
+                self._start_work(proc_idx, batch)
             else:
-                self._push_to_queue(datum)
+                self._push_to_queue(batch)
 
         for future in self._get_next_future():
             await future

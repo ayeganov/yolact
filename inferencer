@@ -183,12 +183,12 @@ class InferenceController(object):
 
         if self._collector.is_ready_to_infer and self._network_pool.is_ready:
             net_output = await self._collector.run_inference(self._network_pool)
-
-            # TODO: Remove next line, it is there only for demonstration purpose only
-            self._loop.add_callback(display_result, net_output)
-            await self._loop.run_in_executor(None, self._sink_output, net_output)
+            if net_output:
+                # TODO: Remove next line, it is there only for demonstration purpose only
+                self._loop.add_callback(display_result, net_output)
+                await self._loop.run_in_executor(None, self._sink_output, net_output)
         else:
-            logger.warn("Dropping messages because collector or network is not ready")
+            logger.warning("Dropping messages because collector or network is not ready")
 
     def _sink_output(self, net_output):
         '''
