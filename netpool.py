@@ -905,7 +905,8 @@ class NetworkProcessPool(ProcessPool):
             logger.info("Terminating process %s", proc.name)
             proc.terminate()
 
-        for proc_idx in range(self._num_procs):
-            for future in self._proc_futures[proc_idx]:
-                if not future.done():
-                    future.cancel()
+        if self._proc_futures:
+            for proc_idx in range(self._num_procs):
+                for future in self._proc_futures[proc_idx]:
+                    if not future.done():
+                        future.cancel()
